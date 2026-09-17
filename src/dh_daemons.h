@@ -18,8 +18,24 @@
 #ifndef DH_DAEMONS_H
 #define DH_DAEMONS_H
 
+// spike 中:除 nsurlsessiond 已端到端验证外,其余为候选,先验 sandbox 是否放行 connect-out
+// (companion 注册报活体即通过),通过再逐个验架桥反代。domain/label 取自设备实测
+// (多数 daemon uid 501 → user 域;locationd uid 0 → system 域)。
 #define DH_DAEMON_LIST(DH_DAEMON) \
-    DH_DAEMON("nsurlsessiond", "网络", "user", "com.apple.nsurlsessiond", "kickstart")
+    DH_DAEMON("nsurlsessiond",     "网络",              "user",   "com.apple.nsurlsessiond",     "kickstart") \
+    DH_DAEMON("apsd",              "推送(APNS)",        "user",   "com.apple.apsd",              "kickstart") \
+    DH_DAEMON("identityservicesd", "iMessage/IDS",      "user",   "com.apple.identityservicesd", "kickstart") \
+    DH_DAEMON("imagent",           "iMessage",          "user",   "com.apple.imagent",           "kickstart") \
+    DH_DAEMON("appstored",         "App Store",         "user",   "com.apple.appstored",         "kickstart") \
+    DH_DAEMON("amsaccountsd",      "媒体账户(AMS)",     "user",   "com.apple.amsaccountsd",       "kickstart") \
+    DH_DAEMON("akd",               "Apple 账户(AuthKit)","user",  "com.apple.akd",               "kickstart") \
+    DH_DAEMON("accountsd",         "账户",              "user",   "com.apple.accountsd",         "kickstart") \
+    DH_DAEMON("devicecheckd",      "设备认证",          "user",   "com.apple.devicecheckd",      "kickstart") \
+    DH_DAEMON("locationd",         "定位",              "system", "com.apple.locationd",         "kickstart")
+// 评估后未纳入(实测 2026-09,sandbox 禁 network-outbound、桥的 connect-out 被 deny,数据出不来):
+//   securityd(uid64) / trustd(uid282) / mobileactivationd / lockdownd。
+//   companion 能注入且不崩,但每 2s 重连会刷 sandbox deny 日志,故不放进白名单。
+//   要拿这类严格 daemon 的数据需换数据出口(mach service / 共享内存等),成本高,另议。
 
 // 绝不注入(崩了进不去系统)。companion 自检兜底,与 loader 的 dh_is_blocked 精神一致。
 #define DH_DAEMON_HARD_BLOCK(X) \
