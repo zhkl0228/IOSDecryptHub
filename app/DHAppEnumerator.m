@@ -1,6 +1,7 @@
 // DHAppEnumerator.m
 
 #import "DHAppEnumerator.h"
+#import "DHConfigStore.h"
 #import <dlfcn.h>
 #import <objc/message.h>
 #import <sys/sysctl.h>
@@ -22,12 +23,91 @@ extern char **environ;
 - (NSString *)localizedName;
 - (NSString *)applicationType;
 - (NSURL *)bundleURL;
+- (NSArray *)appTags;
+- (BOOL)isLaunchProhibited;
 - (BOOL)openApplicationWithBundleID:(NSString *)bundleID;
 @end
 
-static NSDictionary<NSString *, id> *dh_collect(void) {
-    // bundleID -> @{@"name": ..., @"path": ...}
+// 桌面（SpringBoard）显示判定用的两类标记：
+//   hidden          —— 各类服务/诊断/后台 .app（DiagnosticsService、PosterBoard…）
+//   SBInternalAppTag —— 内部/系统 UI（如 Siri），不作为桌面图标
+// LSApplicationProxy 把 Info.plist 的 SBAppTags 透出为 appTags，兜底扫描时直接读
+// Info.plist 的 SBAppTags。
+static BOOL dh_tags_nonhome(id tags) {
+    if (![tags isKindOfClass:[NSArray class]]) return NO;
+    for (id t in (NSArray *)tags) {
+        if (![t isKindOfClass:[NSString class]]) continue;
+        if ([(NSString *)t caseInsensitiveCompare:@"hidden"] == NSOrderedSame) return YES;
+        if ([(NSString *)t caseInsensitiveCompare:@"SBInternalAppTag"] == NSOrderedSame) return YES;
+    }
+    return NO;
+}
+
+// 不在「全部」列表里显示的 App（bundle-ID 精确匹配，最稳；不受沙盒里 isLaunchProhibited/
+// appTags 判据不可靠的影响）。含两类：
+//   1) 并非桌面图标的系统 .app（Continuity/Sidecar、web clip 宿主、Xcode 预览、贴纸、测试 App 等）；
+//   2) 用户明确不想在选择器里看到的（反馈、News 等）。
+// 条目一律小写（比较时对 bundleID 取小写）。日后遇到别的「漏网」再往这里补。
+static BOOL dh_home_denylist(NSString *bundleID) {
+    static NSSet<NSString *> *deny = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        deny = [NSSet setWithArray:@[
+            @"com.apple.sidecar",                       // Continuity/Sidecar
+            @"com.apple.webapp",                        // web clip 宿主
+            @"com.apple.previewshell",                  // Xcode Previews
+            @"com.apple.appleseed.feedbackassistant",   // 反馈
+            @"com.apple.animoji.stickersapp",           // Memoji Stickers
+            @"com.apple.news",                          // News
+            @"com.apsqa.metistest",                     // OTEAutomationTest（非 com.apple.*）
+            @"com.apple.smsfilter",                     // SMS Filter
+        ]];
+    });
+    return bundleID.length > 0 && [deny containsObject:bundleID.lowercaseString];
+}
+
+// Info.plist 里是否声明了图标（CFBundleIcons / CFBundleIconFiles / CFBundleIconFile）。
+static BOOL dh_info_has_icon(NSDictionary *info) {
+    if (![info isKindOfClass:[NSDictionary class]]) return NO;
+    id icons = info[@"CFBundleIcons"];
+    id primary = [icons isKindOfClass:[NSDictionary class]] ? icons[@"CFBundlePrimaryIcon"] : nil;
+    id files = [primary isKindOfClass:[NSDictionary class]] ? primary[@"CFBundleIconFiles"] : nil;
+    if ([files isKindOfClass:[NSArray class]] && [files count] > 0) return YES;
+    id legacy = info[@"CFBundleIconFiles"];
+    if ([legacy isKindOfClass:[NSArray class]] && [legacy count] > 0) return YES;
+    id single = info[@"CFBundleIconFile"];
+    if ([single isKindOfClass:[NSString class]] && [single length] > 0) return YES;
+    return NO;
+}
+
+// 系统 App 是否"确实无图标"——桌面不会显示的一个可靠信号（如 web clip 宿主 com.apple.webapp）。
+// 只有在真读到 Info.plist、且其中未声明任何图标时才判为无图标；读不到就保守保留（fail-open），
+// 避免因沙盒读不到某个系统 bundle 的 Info.plist 而误伤真实桌面 App。
+// 注意：只对系统 App 用；用户 App 即便暂时取不到图标也要显示（用字母占位）。
+static BOOL dh_system_app_iconless(NSString *bundlePath) {
+    if (bundlePath.length == 0) return NO;
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+        [bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+    if (![info isKindOfClass:[NSDictionary class]]) return NO;  // 读不到就不敢判
+    return !dh_info_has_icon(info);
+}
+
+// 绝不出现在列表、也绝不注入的关键进程（与 loader 的 dh_is_blocked 保持一致）。
+// SpringBoard 是桌面进程：注入引擎会 respring 循环，且用户无法从管理器界面把它关回来。
+// 只列有明确依据的；日后若发现别的系统进程注入即出问题，照样本补进来。
+static BOOL dh_enum_blocked(NSString *bundleID) {
+    static NSArray<NSString *> *blocked = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ blocked = @[ @"com.apple.springboard" ]; });
+    return bundleID.length > 0 && [blocked containsObject:bundleID.lowercaseString];
+}
+
+static NSDictionary<NSString *, id> *dh_collect(BOOL includeSystem) {
+    // bundleID -> @{@"name": ..., @"path": ..., @"system": @(BOOL)}
     NSMutableDictionary<NSString *, NSDictionary *> *apps = [NSMutableDictionary dictionary];
+    // 已启用注入的名单：这些 App 一律显示（哪怕关了"显示系统应用"、或本会被桌面可见过滤挡掉），
+    // 否则用户无法从界面把已启用的系统 App 关掉。
+    NSSet<NSString *> *enabledSet = DHReadEnabledBundles() ?: [NSSet set];
     Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
     static const char *frameworks[] = {
         "/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices",
@@ -46,19 +126,41 @@ static NSDictionary<NSString *, id> *dh_collect(void) {
             for (id proxy in proxies) {
                 NSString *bundleID = [proxy respondsToSelector:@selector(applicationIdentifier)]
                     ? [proxy applicationIdentifier] : nil;
-                if (bundleID.length == 0 || [bundleID hasPrefix:@"com.apple."]) continue;
+                if (bundleID.length == 0 || dh_enum_blocked(bundleID)) continue;
                 NSString *type = [proxy respondsToSelector:@selector(applicationType)]
                     ? [proxy applicationType] : nil;
-                if (type.length > 0 && ![type isEqualToString:@"User"]) continue;
-                NSString *name = [proxy respondsToSelector:@selector(localizedName)]
-                    ? [proxy localizedName] : nil;
                 NSString *path = nil;
                 if ([proxy respondsToSelector:@selector(bundleURL)]) {
                     id url = [proxy bundleURL];
                     if ([url isKindOfClass:[NSURL class]]) path = [url path];
                 }
+                // System / Internal / 任何非 User 类型，以及 com.apple.* 前缀，都算系统 App
+                BOOL isSystem = [bundleID hasPrefix:@"com.apple."]
+                    || (type.length > 0 && ![type isEqualToString:@"User"]);
+                // showInAll：是否出现在「全部」tab。系统 App 要开了"显示系统应用"且桌面真实可见才算：
+                //   isLaunchProhibited=YES（贴纸/iMessage 扩展、smsFilter 等，不能从桌面点开）、
+                //   hidden / SBInternalAppTag（服务/诊断/Siri）、无图标（web clip 宿主等）、硬名单，都排除。
+                // 已启用（enabled）的即便不进「全部」，也要收进来，供「已启用」tab 显示以便关闭。
+                BOOL enabled = [enabledSet containsObject:bundleID];
+                BOOL showInAll;
+                if (dh_home_denylist(bundleID)) {
+                    showInAll = NO;   // 硬名单：系统/用户都不进「全部」
+                } else if (isSystem) {
+                    id tags = [proxy respondsToSelector:@selector(appTags)] ? [proxy appTags] : nil;
+                    BOOL prohibited = [proxy respondsToSelector:@selector(isLaunchProhibited)]
+                        && [proxy isLaunchProhibited];
+                    showInAll = includeSystem && !prohibited && !dh_tags_nonhome(tags)
+                        && !dh_system_app_iconless(path);
+                } else {
+                    showInAll = YES;
+                }
+                if (!showInAll && !enabled) continue;
+                NSString *name = [proxy respondsToSelector:@selector(localizedName)]
+                    ? [proxy localizedName] : nil;
                 apps[bundleID] = @{ @"name": name.length ? name : bundleID,
-                                    @"path": path ?: @"" };
+                                    @"path": path ?: @"",
+                                    @"system": @(isSystem),
+                                    @"showInAll": @(showInAll) };
             }
         }
     } @catch (__unused NSException *e) {
@@ -88,10 +190,19 @@ static NSDictionary<NSString *, id> *dh_collect(void) {
                 NSDictionary *info2 = [NSDictionary dictionaryWithContentsOfFile:
                     [appPath stringByAppendingPathComponent:@"Info.plist"]];
                 NSString *bundleID = info2[@"CFBundleIdentifier"];
-                if (bundleID.length == 0 || [bundleID hasPrefix:@"com.apple."]) continue;
+                if (bundleID.length == 0 || dh_enum_blocked(bundleID)) continue;
+                BOOL isSystem = [bundleID hasPrefix:@"com.apple."];
+                BOOL enabled = [enabledSet containsObject:bundleID];
+                BOOL showInAll;
+                if (dh_home_denylist(bundleID)) showInAll = NO;
+                else if (isSystem) showInAll = includeSystem
+                    && !dh_tags_nonhome(info2[@"SBAppTags"]) && dh_info_has_icon(info2);
+                else showInAll = YES;
+                if (!showInAll && !enabled) continue;
                 if (apps[bundleID]) continue;   // LaunchServices 已给出更完整的名字
                 NSString *name = info2[@"CFBundleDisplayName"] ?: info2[@"CFBundleName"];
-                apps[bundleID] = @{ @"name": name.length ? name : bundleID, @"path": appPath };
+                apps[bundleID] = @{ @"name": name.length ? name : bundleID, @"path": appPath,
+                                    @"system": @(isSystem), @"showInAll": @(showInAll) };
             }
         }
     }
@@ -108,17 +219,26 @@ static NSDictionary<NSString *, id> *dh_collect(void) {
                 NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
                     [appPath stringByAppendingPathComponent:@"Info.plist"]];
                 NSString *bundleID = info[@"CFBundleIdentifier"];
-                if (bundleID.length == 0 || [bundleID hasPrefix:@"com.apple."]) continue;
+                if (bundleID.length == 0 || dh_enum_blocked(bundleID)) continue;
+                BOOL isSystem = [bundleID hasPrefix:@"com.apple."];
+                BOOL enabled = [enabledSet containsObject:bundleID];
+                BOOL showInAll;
+                if (dh_home_denylist(bundleID)) showInAll = NO;
+                else if (isSystem) showInAll = includeSystem
+                    && !dh_tags_nonhome(info[@"SBAppTags"]) && dh_info_has_icon(info);
+                else showInAll = YES;
+                if (!showInAll && !enabled) continue;
                 NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"];
-                apps[bundleID] = @{ @"name": name.length ? name : bundleID, @"path": appPath };
+                apps[bundleID] = @{ @"name": name.length ? name : bundleID, @"path": appPath,
+                                    @"system": @(isSystem), @"showInAll": @(showInAll) };
             }
         }
     }
     return apps;
 }
 
-NSArray<DHAppInfo *> *DHInstalledApps(void) {
-    NSDictionary<NSString *, NSDictionary *> *raw = dh_collect();
+NSArray<DHAppInfo *> *DHInstalledApps(BOOL includeSystem) {
+    NSDictionary<NSString *, NSDictionary *> *raw = dh_collect(includeSystem);
     NSMutableArray<DHAppInfo *> *out = [NSMutableArray arrayWithCapacity:raw.count];
     for (NSString *bundleID in raw) {
         DHAppInfo *app = [[DHAppInfo alloc] init];
@@ -126,6 +246,8 @@ NSArray<DHAppInfo *> *DHInstalledApps(void) {
         app.name = raw[bundleID][@"name"];
         NSString *path = raw[bundleID][@"path"];
         app.bundlePath = path.length ? path : nil;
+        app.isSystem = [raw[bundleID][@"system"] boolValue];
+        app.showInAll = [raw[bundleID][@"showInAll"] boolValue];
         [out addObject:app];
     }
     [out sortUsingComparator:^NSComparisonResult(DHAppInfo *l, DHAppInfo *r) {

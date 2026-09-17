@@ -7,14 +7,21 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// 「显示系统 App」开关：存管理器 App 自己的 NSUserDefaults，默认关。
+#define DH_SHOW_SYSTEM_APPS_KEY @"dhShowSystemApps"
+
 @interface DHAppInfo : NSObject
 @property (nonatomic, copy) NSString *bundleID;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, copy, nullable) NSString *bundlePath;
+@property (nonatomic, assign) BOOL isSystem;   // 系统 App（applicationType==System 或 com.apple.* 前缀）
+@property (nonatomic, assign) BOOL showInAll;  // 是否出现在「全部」tab；已启用但不符合条件的系统 App 为 NO（只在「已启用」tab 显示）
 @end
 
-/// 已安装的用户 App（按显示名排序，已过滤系统 App）：先走 LaunchServices，失败兜底扫容器目录
-NSArray<DHAppInfo *> *DHInstalledApps(void);
+/// 已安装的 App（按显示名排序）：先走 LaunchServices，失败兜底扫容器目录。
+/// includeSystem=NO 只列用户 App；=YES 时并入可注入的系统 App（有 UIKit、可启动的系统应用，
+/// 如 App Store / Safari / 设置），但**始终**排除关键进程（见 .m 里的黑名单，如 SpringBoard）。
+NSArray<DHAppInfo *> *DHInstalledApps(BOOL includeSystem);
 
 /// 单个 App 的原始图标：先取系统图标缓存，再退回读 bundle 内的图标文件；都可能失败时返回 nil
 UIImage *_Nullable DHAppIcon(NSString *bundleID, NSString *_Nullable bundlePath);

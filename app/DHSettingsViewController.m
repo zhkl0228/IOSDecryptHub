@@ -8,9 +8,11 @@
 #import "DHConfigStore.h"
 #import "dh_shared.h"
 #import "DHVersionsViewController.h"
+#import "DHAppEnumerator.h"
 
 typedef NS_ENUM(NSInteger, DHSection) {
     DHSectionUpdate = 0,
+    DHSectionApps,
     DHSectionAbout,
     DHSectionCount,
 };
@@ -92,6 +94,7 @@ static void dh_settings_state_changed(__unused CFNotificationCenterRef center,
 - (NSInteger)tableView:(__unused UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
         case DHSectionUpdate: return self.hasUpdateRow ? 3 : 2;   // 检查更新 /[安装新版本]/ 历史版本
+        case DHSectionApps:   return 1;   // 显示系统 App 开关
         case DHSectionAbout:  return 2 + (NSInteger)dh_social_rows().count;   // 公众号 + 社群 + 版本
         default: return 0;
     }
@@ -100,12 +103,17 @@ static void dh_settings_state_changed(__unused CFNotificationCenterRef center,
 - (NSString *)tableView:(__unused UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
         case DHSectionUpdate: return @"软件更新";
+        case DHSectionApps:   return @"应用列表";
         case DHSectionAbout:  return @"关于";
         default: return nil;
     }
 }
 
 - (NSString *)tableView:(__unused UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == DHSectionApps) {
+        return @"打开后，「全部」列表里会显示可注入的系统应用（如 App Store、Safari、设置）。"
+               @"系统进程（无界面的后台服务）不受影响。";
+    }
     if (section != DHSectionUpdate) return nil;
     NSDictionary *last = self.updaterState[@"lastOp"];
     NSString *result = [last isKindOfClass:[NSDictionary class]] ? last[@"result"] : nil;
@@ -137,6 +145,22 @@ static void dh_settings_state_changed(__unused CFNotificationCenterRef center,
     return cell;
 }
 
+- (UITableViewCell *)systemToggleCell {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.textLabel.text = @"显示系统 App";
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    UISwitch *sw = [[UISwitch alloc] init];
+    sw.on = [[NSUserDefaults standardUserDefaults] boolForKey:DH_SHOW_SYSTEM_APPS_KEY];
+    [sw addTarget:self action:@selector(toggleShowSystem:) forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = sw;
+    return cell;
+}
+
+- (void)toggleShowSystem:(UISwitch *)sw {
+    // 只存开关；返回主界面时 viewWillAppear 会重新枚举并刷新列表
+    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:DH_SHOW_SYSTEM_APPS_KEY];
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == DHSectionUpdate) {
         if (indexPath.row == 0) return [self actionCell:@"检查更新" image:nil enabled:!self.working];
@@ -144,6 +168,9 @@ static void dh_settings_state_changed(__unused CFNotificationCenterRef center,
             return [self actionCell:@"安装新版本" image:nil enabled:!self.working];
         }
         return [self actionCell:@"历史版本" image:nil enabled:!self.working];
+    }
+    if (indexPath.section == DHSectionApps) {
+        return [self systemToggleCell];
     }
     if (indexPath.row == 0) {   // 公众号：整行图，点一下复制账号名
         UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"follow"];
@@ -214,6 +241,7 @@ static void dh_settings_state_changed(__unused CFNotificationCenterRef center,
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (self.working) return;
+    if (indexPath.section == DHSectionApps) return;   // 开关自理，不响应点击
     if (indexPath.section == DHSectionAbout) {
         NSArray<NSArray<NSString *> *> *social = dh_social_rows();
         if (indexPath.row >= 1 && indexPath.row <= (NSInteger)social.count) {

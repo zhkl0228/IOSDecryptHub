@@ -64,13 +64,25 @@ static NSArray<NSString *> *dh_config_candidates(void) {
 // 开关语义保持处处一致：列在名单里的 App 就会被注入，没有例外。
 // 相关：管理器 App 与设置面板同样出现在列表里，可以被显式打开（例如当服务宿主用）。
 
+// 绝不注入的关键进程（与管理器枚举的 dh_enum_blocked 保持一致）。
+// SpringBoard 是桌面进程：注入引擎会 respring 循环，且用户无法从管理器界面把它关回来。
+// 这类进程即便被写进名单也一律拒绝。
+static BOOL dh_is_blocked(NSString *bundleID) {
+    static NSString *const blocked[] = { @"com.apple.springboard" };
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        if ([bundleID caseInsensitiveCompare:blocked[i]] == NSOrderedSame) return YES;
+    }
+    return NO;
+}
+
 // 读取偏好：判断当前 bundleID 是否在启用列表中
 static BOOL dh_should_inject(NSString *bundleID) {
     if (!bundleID || bundleID.length == 0) return NO;
 
-    // 跳过系统关键进程（避免不必要的开销）
-    if ([bundleID hasPrefix:@"com.apple."]) return NO;
-
+    // 只挡关键进程黑名单，其余一律按名单判断。
+    // 原先这里整片跳过 com.apple.*，导致系统 App 永远无法注入；为支持「设置里勾选系统 App」
+    // 而放开——代价是所有 UIKit 系统进程启动时会多读一次名单 plist（开销极小）。
+    if (dh_is_blocked(bundleID)) return NO;
 
     NSArray *enabled = nil;
     const char *source = "none";

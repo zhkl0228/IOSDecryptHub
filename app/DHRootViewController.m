@@ -121,7 +121,8 @@ typedef NS_ENUM(NSInteger, DHFilter) {
 - (void)reload {
     // 有新版本就在齿轮上点个橙点：用户不主动翻设置也能知道
     [self refreshUpdateDot];
-    self.allApps = DHInstalledApps();
+    BOOL showSystem = [[NSUserDefaults standardUserDefaults] boolForKey:DH_SHOW_SYSTEM_APPS_KEY];
+    self.allApps = DHInstalledApps(showSystem);
     self.enabled = [[DHReadEnabledBundles() mutableCopy] ?: [NSMutableSet set] mutableCopy];
     [self rebuild];
     [self.tableView reloadData];
@@ -151,7 +152,12 @@ typedef NS_ENUM(NSInteger, DHFilter) {
 
     NSMutableArray<DHAppInfo *> *pool = [NSMutableArray array];
     for (DHAppInfo *app in self.allApps) {
-        if (self.enabledOnly && ![self.enabled containsObject:app.bundleID]) continue;
+        if (self.enabledOnly) {
+            if (![self.enabled containsObject:app.bundleID]) continue;
+        } else if (!app.showInAll) {
+            // 「全部」tab 只显示合格项；已启用但不符合条件的系统 App 只在「已启用」tab 出现
+            continue;
+        }
         if (self.searching &&
             ![app.name localizedCaseInsensitiveContainsString:query] &&
             ![app.bundleID localizedCaseInsensitiveContainsString:query]) continue;
@@ -268,11 +274,13 @@ typedef NS_ENUM(NSInteger, DHFilter) {
     more.menu = [self menuForApp:app];               // 每次重建：菜单内容跟着状态走
 
     cell.textLabel.text = app.name;
+    // 系统 App 在副标题里标一下，跟第三方区分开
+    NSString *base = app.isSystem ? [@"系统 · " stringByAppendingString:app.bundleID] : app.bundleID;
     BOOL on = [self.enabled containsObject:app.bundleID];
     if ([self.pendingRestart containsObject:app.bundleID]) {
         // 改了开关还没重启：直接标在这一行上，比横幅更贴身
         NSMutableAttributedString *subtitle = [[NSMutableAttributedString alloc]
-            initWithString:app.bundleID
+            initWithString:base
                 attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
         [subtitle appendAttributedString:[[NSAttributedString alloc]
             initWithString:@"　需重启"
@@ -281,7 +289,7 @@ typedef NS_ENUM(NSInteger, DHFilter) {
     } else if (on && self.injected[app.bundleID]) {
         NSNumber *port = self.injected[app.bundleID][@"port"];
         NSMutableAttributedString *subtitle = [[NSMutableAttributedString alloc]
-            initWithString:app.bundleID
+            initWithString:base
                 attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
         NSString *mark = port ? [NSString stringWithFormat:@"　已注入 :%@", port] : @"　已注入";
         [subtitle appendAttributedString:[[NSAttributedString alloc]
@@ -290,7 +298,7 @@ typedef NS_ENUM(NSInteger, DHFilter) {
         cell.detailTextLabel.attributedText = subtitle;
     } else if (on && DHAppProcessRunning(app)) {
         NSMutableAttributedString *subtitle = [[NSMutableAttributedString alloc]
-            initWithString:app.bundleID
+            initWithString:base
                 attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
         [subtitle appendAttributedString:[[NSAttributedString alloc]
             initWithString:@"　未注入"
@@ -298,7 +306,7 @@ typedef NS_ENUM(NSInteger, DHFilter) {
         cell.detailTextLabel.attributedText = subtitle;
     } else {
         cell.detailTextLabel.attributedText = nil;
-        cell.detailTextLabel.text = app.bundleID;
+        cell.detailTextLabel.text = base;
     }
     cell.imageView.image = DHAppListIcon(app.bundleID, app.bundlePath, app.name);
     toggle.on = [self.enabled containsObject:app.bundleID];
