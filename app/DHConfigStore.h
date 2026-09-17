@@ -17,6 +17,13 @@ NSSet<NSString *> *DHReadEnabledBundles(void);
 /// rootHide 写不动 jb 时丢 set-enabled 请求，由 updated.sh 拷贝。不在 UI 线程等 launchd。
 BOOL DHWriteEnabledBundles(NSSet<NSString *> *bundleIDs, NSError *_Nullable *_Nullable error);
 
+/// 已启用的系统 daemon 注入名单（按可执行名，非 bundleId）。companion 只读 jb 配置那份，
+/// 故这里也以 jb 配置为准（enabledExecutables 键）。
+NSSet<NSString *> *DHReadEnabledExecutables(void);
+/// 写回系统 daemon 名单：读改写 jb 配置（保留 enabledBundles），rootless 下 App 直接写得动；
+/// rootHide 下 App 对 jb 是 EPERM，改投 set-enabled 请求由 daemon 落盘。成功返回 YES。
+BOOL DHWriteEnabledExecutables(NSSet<NSString *> *execNames, NSError *_Nullable *_Nullable error);
+
 /// 引擎元信息 {version, variant, arch}，缺失返回空字典
 NSDictionary *DHReadEngineMeta(void);
 /// daemon 写的更新状态，缺失返回空字典
@@ -24,6 +31,10 @@ NSDictionary *DHReadUpdaterState(void);
 
 /// 扫本机 8088..8108：bundleId → @{ @"port": N, @"version": @"..." }。引擎已进进程才会响应。
 NSDictionary<NSString *, NSDictionary *> *DHProbeInjectedApps(void);
+
+/// 本机 LAN IPv4（优先 en0/WiFi，排除 loopback 与 169.254 link-local）；取不到返回 nil。
+/// 供界面把「已注入」显示成 IP:端口，与悬浮窗一致，便于直接在浏览器/idh 访问反代端口。
+NSString *_Nullable DHLocalLANAddress(void);
 
 /// 向 daemon 提交更新请求（check / install / rollback）；version 非空时安装指定版本
 BOOL DHWriteUpdateRequest(NSString *action, NSString *_Nullable version);

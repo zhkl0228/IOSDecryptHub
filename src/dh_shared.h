@@ -24,6 +24,9 @@
 
 #define DH_DOMAIN_LOADER  @"com.iosdecrypthub.loader"
 #define DH_KEY_BUNDLES    @"enabledBundles"
+// 系统 daemon 注入名单(按可执行名,非 bundleId)。与 enabledBundles 同存一份 plist:
+//   manager 写、companion(注入进 daemon 侧)读。daemon 没有 bundleId,只能按 exec 名门控。
+#define DH_KEY_EXECS      @"enabledExecutables"
 
 // 相对 bootstrap 根目录。旧值少了 usr/lib/，App 会写到 <jbroot>/IOSDecryptHub/...，
 // 开关表现为「写入启用名单失败」。
@@ -58,4 +61,6 @@
 #define DH_REQ_RESTART    @"restart"
 #define DH_REQ_STOP       @"stop"
 #define DH_REQ_SET_ENABLED @"set-enabled"
+// rootHide 兜底:App 写不动 jb 的 enabledExecutables 时投这个请求,daemon 落盘(见 daemon)
+#define DH_REQ_SET_EXECS  @"set-execs"
 #define DH_REQ_NONE       @"none"

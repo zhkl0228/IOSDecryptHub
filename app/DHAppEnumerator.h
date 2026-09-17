@@ -16,7 +16,20 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) NSString *bundlePath;
 @property (nonatomic, assign) BOOL isSystem;   // 系统 App（applicationType==System 或 com.apple.* 前缀）
 @property (nonatomic, assign) BOOL showInAll;  // 是否出现在「全部」tab；已启用但不符合条件的系统 App 为 NO（只在「已启用」tab 显示）
+// —— 系统 daemon（isDaemon=YES 时有效；来自 dh_daemons.h 策展表）——
+@property (nonatomic, assign) BOOL isDaemon;                    // 系统 daemon（非桌面 App，按 execName 注入门控）
+@property (nonatomic, copy, nullable) NSString *execName;       // 可执行名（注入名单/进程匹配用）
+@property (nonatomic, copy, nullable) NSString *launchdLabel;   // launchd 服务标识（kickstart 用）
+@property (nonatomic, copy, nullable) NSString *launchdDomain;  // system / user / gui
+@property (nonatomic, copy, nullable) NSString *restartPolicy;  // kickstart / sigkill / manual
 @end
+
+/// dh_daemons.h 策展的系统 daemon 列表（当前仅 nsurlsessiond）。每项 isDaemon=YES。
+NSArray<DHAppInfo *> *DHSystemDaemons(void);
+
+/// 重启一个系统 daemon：launchctl kickstart -k <domain>/<uid>/<label>（user/gui 域拼当前 uid）。
+/// App 非 root，能否成功取决于对该域的权限；失败返回 NO，调用方应提示手动重启。
+BOOL DHRestartDaemon(DHAppInfo *daemon);
 
 /// 已安装的 App（按显示名排序）：先走 LaunchServices，失败兜底扫容器目录。
 /// includeSystem=NO 只列用户 App；=YES 时并入可注入的系统 App（有 UIKit、可启动的系统应用，

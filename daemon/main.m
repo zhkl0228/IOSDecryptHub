@@ -893,23 +893,33 @@ static void dh_do_rollback(void) {
     dh_log("回滚到 %s 完成", ((NSString *)bakVersion).UTF8String);
 }
 
-static void dh_do_set_enabled(id raw) {
-    NSMutableArray<NSString *> *bundles = [NSMutableArray array];
+// 请求里的字符串数组做清洗(去空/超长,限量,排序)。
+static NSArray<NSString *> *dh_sanitize_names(id raw) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
     if ([raw isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)raw) {
             if (![item isKindOfClass:[NSString class]]) continue;
-            NSString *bid = item;
-            if (bid.length == 0 || bid.length > 256) continue;
-            [bundles addObject:bid];
-            if (bundles.count >= 4096) break;
+            NSString *s = item;
+            if (s.length == 0 || s.length > 256) continue;
+            [out addObject:s];
+            if (out.count >= 4096) break;
         }
     }
-    [bundles sortUsingSelector:@selector(compare:)];
+    [out sortUsingSelector:@selector(compare:)];
+    return out;
+}
+
+// 读改写 config/enabledBundles.plist 的一个键(**保留同文件其他键**,enabledBundles 与
+// enabledExecutables 共存一份),原子写回,chown mobile / 0666。返回是否成功。
+static BOOL dh_write_config_key(NSString *key, NSArray<NSString *> *values) {
     NSString *dir = [g_engine_dir stringByAppendingPathComponent:@"config"];
     NSString *path = [dir stringByAppendingPathComponent:@"enabledBundles.plist"];
     mkdir(dir.fileSystemRepresentation, 0777);
+    NSMutableDictionary *cfg = [(dh_read_plist(path) ?: @{}) mutableCopy];
+    if (![cfg isKindOfClass:[NSMutableDictionary class]]) cfg = [NSMutableDictionary dictionary];
+    cfg[key] = values;
     NSError *serErr = nil;
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:@{DH_KEY_BUNDLES: bundles}
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:cfg
         format:NSPropertyListXMLFormat_v1_0 options:0 error:&serErr];
     BOOL ok = NO;
     if (data) {
@@ -939,11 +949,30 @@ static void dh_do_set_enabled(id raw) {
         chown(path.fileSystemRepresentation, 501, 501);
         chmod(dir.fileSystemRepresentation, 0777);
         chmod(path.fileSystemRepresentation, 0666);
+    }
+    return ok;
+}
+
+static void dh_do_set_enabled(id raw) {
+    NSArray<NSString *> *bundles = dh_sanitize_names(raw);
+    if (dh_write_config_key(DH_KEY_BUNDLES, bundles)) {
         dh_log("已写入启用名单 %lu 项", (unsigned long)bundles.count);
         dh_record_op(DH_REQ_SET_ENABLED, nil, @"ok", nil, nil);
     } else {
-        dh_log("写入启用名单失败: %s", path.UTF8String ?: "");
+        dh_log("写入启用名单失败");
         dh_record_op(DH_REQ_SET_ENABLED, nil, @"error", @"write failed", nil);
+    }
+}
+
+// rootHide 兜底:App 写不动 jb 的系统进程名单(enabledExecutables)时投 set-execs 请求,由此落盘。
+static void dh_do_set_execs(id raw) {
+    NSArray<NSString *> *execs = dh_sanitize_names(raw);
+    if (dh_write_config_key(DH_KEY_EXECS, execs)) {
+        dh_log("已写入系统进程名单 %lu 项", (unsigned long)execs.count);
+        dh_record_op(DH_REQ_SET_EXECS, nil, @"ok", nil, nil);
+    } else {
+        dh_log("写入系统进程名单失败");
+        dh_record_op(DH_REQ_SET_EXECS, nil, @"error", @"write failed", nil);
     }
 }
 
@@ -984,6 +1013,8 @@ static void dh_process_request(void) {
         dh_do_stop([bundle isKindOfClass:[NSString class]] ? bundle : nil);
     } else if ([action isEqualToString:DH_REQ_SET_ENABLED]) {
         dh_do_set_enabled(req[DH_KEY_BUNDLES]);
+    } else if ([action isEqualToString:DH_REQ_SET_EXECS]) {
+        dh_do_set_execs(req[DH_KEY_EXECS]);
     } else {
         dh_log("未知请求: %s，已忽略", action.UTF8String);
     }

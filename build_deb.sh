@@ -70,6 +70,14 @@ DAEMON_PLIST_TMPL="$SCRIPT_DIR/daemon/com.iosdecrypthub.updated.plist"
 REPO_KEY="$SCRIPT_DIR/repo/iosdecrypthub-archive-keyring.gpg"
 APP_NAME="IOSDecryptHubManager"
 DAEMON_BIN="IOSDecryptHubUpdated"
+# 系统 daemon 注入(M1):companion 注入进白名单 daemon,collector 反代出 LAN 端口
+COMPANION_SRC="$SCRIPT_DIR/src/companion.m"
+FISHHOOK_SRC="$SCRIPT_DIR/src/fishhook.c"
+COLLECTOR_SRC="$SCRIPT_DIR/daemon/collector.c"
+DAEMONS_HDR="$SCRIPT_DIR/src/dh_daemons.h"
+COMPANION_DYLIB="DHCompanion.dylib"
+COLLECTOR_BIN="IOSDecryptHubCollector"
+COLLECTOR_LABEL="com.iosdecrypthub.collector"
 
 compile_loader() {
     local ARCHS="$1"
@@ -123,6 +131,65 @@ compile_daemon() {
         "$DAEMON_SRC" -o "$OUT"
 }
 
+compile_companion() {
+    local ARCHS="$1"
+    local OUT="$2"
+    local ARCH_FLAGS=()
+    local ARCH
+    for ARCH in $ARCHS; do
+        ARCH_FLAGS+=( -arch "$ARCH" )
+    done
+    info "编译 companion (archs=$ARCHS)..."
+    mkdir -p "$(dirname "$OUT")"
+    # companion 非 ARC(constructor + 手动 socket);fishhook.c 一起编,PAC 写入见其 ptrauth 补丁。
+    $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
+        -dynamiclib -install_name /usr/lib/IOSDecryptHub/$COMPANION_DYLIB \
+        -ObjC -Wall -O2 \
+        -I"$SCRIPT_DIR/src" \
+        -framework Foundation \
+        "$COMPANION_SRC" "$FISHHOOK_SRC" -o "$OUT"
+}
+
+compile_collector() {
+    local ARCHS="$1"
+    local OUT="$2"
+    local ARCH_FLAGS=()
+    local ARCH
+    for ARCH in $ARCHS; do
+        ARCH_FLAGS+=( -arch "$ARCH" )
+    done
+    info "编译 collector (archs=$ARCHS)..."
+    mkdir -p "$(dirname "$OUT")"
+    $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
+        -Wall -O2 \
+        "$COLLECTOR_SRC" -o "$OUT"
+}
+
+# 由 dh_daemons.h 的 DH_DAEMON(exec,...) 单一来源生成 companion 的 Filter → Executables plist。
+gen_companion_filter() {
+    local OUT="$1"
+    local EXECS
+    EXECS=$(grep -oE 'DH_DAEMON\("[^"]+"' "$DAEMONS_HDR" | sed -E 's/DH_DAEMON\("([^"]+)"/\1/')
+    [ -n "$EXECS" ] || error "dh_daemons.h 未解析出任何 DH_DAEMON 可执行名"
+    {
+        echo '<?xml version="1.0" encoding="UTF-8"?>'
+        echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        echo '<plist version="1.0">'
+        echo '<dict>'
+        echo '	<key>Filter</key>'
+        echo '	<dict>'
+        echo '		<key>Executables</key>'
+        echo '		<array>'
+        while IFS= read -r e; do
+            [ -n "$e" ] && echo "			<string>$e</string>"
+        done <<< "$EXECS"
+        echo '		</array>'
+        echo '	</dict>'
+        echo '</dict>'
+        echo '</plist>'
+    } > "$OUT"
+}
+
 verify_macho_arch() {
     local PATH_TO_VERIFY="$1"
     local EXPECTED_ARCH="$2"
@@ -162,12 +229,19 @@ build_variant() {
     local LOADER_OUT="$BUILD_DIR/_loader-${VARIANT}/IOSDecryptHubLoader.dylib"
     local APP_EXEC="$BUILD_DIR/_app-${VARIANT}/$APP_NAME"
     local DAEMON_OUT="$BUILD_DIR/_daemon-${VARIANT}/$DAEMON_BIN"
+    local COMPANION_OUT="$BUILD_DIR/_companion-${VARIANT}/$COMPANION_DYLIB"
+    local COMPANION_FILTER_OUT="$BUILD_DIR/_companion-${VARIANT}/DHCompanion.plist"
+    local COLLECTOR_OUT="$BUILD_DIR/_collector-${VARIANT}/$COLLECTOR_BIN"
     local ENGINE_DYLIB
 
     ENGINE_DYLIB=$(require_vendor_dylib "$ENGINE_VARIANT" "$MACHO_ARCHS")
     compile_loader "$MACHO_ARCHS" "$LOADER_OUT"
     compile_app "$APP_MACHO_ARCHS" "$APP_EXEC"
     compile_daemon "$APP_MACHO_ARCHS" "$DAEMON_OUT"
+    # companion 要 arm64e 切片才能注入 arm64e 系统 daemon;collector 是 root 独立进程,arm64 即可。
+    compile_companion "$MACHO_ARCHS" "$COMPANION_OUT"
+    compile_collector "arm64" "$COLLECTOR_OUT"
+    gen_companion_filter "$COMPANION_FILTER_OUT"
 
     info "打包 $VARIANT (arch=$ARCHITECTURE, prefix=${PREFIX:-/})..."
     rm -rf "$STAGE"
@@ -197,6 +271,11 @@ CTRL
 
     cp "$LOADER_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     cp "$SCRIPT_DIR/Filter.plist" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.plist"
+
+    # 系统 daemon 注入(M1):companion(Filter=Executables,由 dh_daemons.h 生成)+ collector
+    cp "$COMPANION_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
+    cp "$COMPANION_FILTER_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHCompanion.plist"
+    cp "$COLLECTOR_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \
@@ -320,6 +399,26 @@ if command -v launchctl >/dev/null 2>&1; then
     launchctl bootout system "\$LAUNCHD_PLIST" 2>/dev/null || true
     launchctl bootstrap system "\$LAUNCHD_PLIST" 2>/dev/null || launchctl load "\$LAUNCHD_PLIST" 2>/dev/null || true
 fi
+# 系统 daemon 注入收集器/反代(M1):root 常驻(RunAtLoad+KeepAlive),bind LAN 端口反代。
+# 严格单实例:先 bootout 再 bootstrap,避免抢同名 UNIX socket / LAN 端口(errno=48)。
+COLLECTOR_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.collector.plist"
+printf '%s\n' \
+    '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0"><dict>' \
+    '<key>Label</key><string>com.iosdecrypthub.collector</string>' \
+    '<key>ProgramArguments</key><array>' \
+    "<string>${PREFIX}/usr/lib/IOSDecryptHub/IOSDecryptHubCollector</string>" \
+    '</array>' \
+    '<key>RunAtLoad</key><true/>' \
+    '<key>KeepAlive</key><true/>' \
+    '<key>StandardOutPath</key><string>/var/log/iosdecrypthub-collector.log</string>' \
+    '<key>StandardErrorPath</key><string>/var/log/iosdecrypthub-collector.log</string>' \
+    '</dict></plist>' > "\$COLLECTOR_PLIST"
+if command -v launchctl >/dev/null 2>&1; then
+    launchctl bootout system "\$COLLECTOR_PLIST" 2>/dev/null || true
+    launchctl bootstrap system "\$COLLECTOR_PLIST" 2>/dev/null || launchctl load "\$COLLECTOR_PLIST" 2>/dev/null || true
+fi
 # 刷新主屏幕图标（失败不阻断安装）
 if command -v uicache >/dev/null 2>&1; then
     uicache -p "${PREFIX}/Applications/$APP_NAME.app" 2>/dev/null || true
@@ -333,8 +432,10 @@ POSTINST
 set -e
 if [ "\$1" = "remove" ]; then
     LAUNCHD_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.updated.plist"
+    COLLECTOR_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.collector.plist"
     if command -v launchctl >/dev/null 2>&1; then
         launchctl bootout system "\$LAUNCHD_PLIST" 2>/dev/null || true
+        launchctl bootout system "\$COLLECTOR_PLIST" 2>/dev/null || true
     fi
 fi
 if [ "\$1" = "purge" ]; then
@@ -358,11 +459,19 @@ POSTRM
     verify_macho_arch \
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN" \
         "$APP_MACHO_ARCHS" "$VARIANT updater daemon"
+    verify_macho_arch \
+        "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB" \
+        "$MACHO_ARCHS" "$VARIANT companion"
+    verify_macho_arch \
+        "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN" \
+        "arm64" "$VARIANT collector"
 
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
+    ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
+    ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
 
     cp -R "$STAGE/." "$PKG_STAGE/"
     find "$PKG_STAGE" -type d -exec chmod 0755 {} +
@@ -376,6 +485,8 @@ POSTRM
     # 不引入任何与已验证产物不同的变量。
     chmod 0755 "$PKG_STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
+    chmod 0755 "$PKG_STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
+    chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
 
     if ! dpkg-deb --build --root-owner-group "$PKG_STAGE" "$DEB_OUT" 2>"$BUILD_DIR/_dpkg-$VARIANT.log"; then
         rm -rf "$PKG_STAGE"
@@ -442,6 +553,21 @@ POSTRM
     esac
 
     case "$PACKAGE_CONTENTS" in
+        *"/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"*) ;;
+        *) error "$VARIANT 缺少 companion(系统 daemon 注入)" ;;
+    esac
+
+    case "$PACKAGE_CONTENTS" in
+        *"/MobileSubstrate/DynamicLibraries/DHCompanion.plist"*) ;;
+        *) error "$VARIANT 缺少 companion 过滤器" ;;
+    esac
+
+    case "$PACKAGE_CONTENTS" in
+        *"/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"*) ;;
+        *) error "$VARIANT 缺少 collector(反代收集器)" ;;
+    esac
+
+    case "$PACKAGE_CONTENTS" in
         *"/usr/lib/IOSDecryptHub/updated.sh"*) ;;
         *) error "$VARIANT 缺少 updater 包装脚本" ;;
     esac
@@ -464,6 +590,18 @@ POSTRM
     grep -q '<string>com.apple.UIKit</string>' \
         "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.plist" \
         || error "$VARIANT 的 MobileLoader 过滤器未覆盖 UIKit App"
+
+    # companion 过滤器必须是 Executables(不是 Bundles)且覆盖 dh_daemons.h 里的白名单
+    grep -q '<key>Executables</key>' \
+        "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHCompanion.plist" \
+        || error "$VARIANT 的 companion 过滤器不是 Executables 型"
+    grep -q '<string>nsurlsessiond</string>' \
+        "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHCompanion.plist" \
+        || error "$VARIANT 的 companion 过滤器未覆盖 nsurlsessiond"
+
+    # postinst 必须装 collector 的 launchd 服务
+    grep -q "$COLLECTOR_LABEL" "$STAGE/DEBIAN/postinst" \
+        || error "$VARIANT 的 postinst 未装 collector 服务"
 
     grep -q '<string>com.iosdecrypthub.updated</string>' \
         "$STAGE/${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.updated.plist" \

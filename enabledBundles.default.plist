@@ -4,5 +4,7 @@
 <dict>
     <key>enabledBundles</key>
     <array/>
+    <key>enabledExecutables</key>
+    <array/>
 </dict>
 </plist>

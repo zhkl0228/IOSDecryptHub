@@ -3,6 +3,10 @@
 #import "DHConfigStore.h"
 #import "dh_shared.h"
 #import <dlfcn.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
 
 NSString *_Nullable DHBootstrapRoot(void) {
     Dl_info info = {0};
@@ -111,6 +115,43 @@ static BOOL dh_try_write_jb_config(NSData *data) {
     return YES;
 }
 
+// 读改写 jb 配置:把 key 设成 values,**保留同文件里其他键**(enabledBundles / enabledExecutables
+// 共存一份),再原子写回。enabledBundles 与 enabledExecutables 都经这里落 jb,互不覆盖。
+static BOOL dh_write_jb_config_key(NSString *key, NSArray<NSString *> *values) {
+    NSString *path = dh_config_path();
+    if (path.length == 0) return NO;
+    NSMutableDictionary *dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
+    if (![dict isKindOfClass:[NSMutableDictionary class]]) dict = [NSMutableDictionary dictionary];
+    dict[key] = values ?: @[];
+    NSError *error = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:dict
+        format:NSPropertyListXMLFormat_v1_0 options:0 error:&error];
+    if (!data) return NO;
+    return dh_try_write_jb_config(data);
+}
+
+// 读改写 loader prefs 的一个 key(保留其他 key)。prefs 是 App 权威副本,且 rootHide 下
+// updated.sh 用 `cp prefs → jb config` 同步——所以 prefs 必须同时含 enabledBundles 与
+// enabledExecutables,否则那次 cp 会把另一个抹掉。写失败经 outError 上报。
+static BOOL dh_write_prefs_key(NSString *key, NSArray<NSString *> *values, NSError **outError) {
+    NSMutableDictionary *prefs = [[NSDictionary dictionaryWithContentsOfFile:DH_LOADER_PREFS] mutableCopy];
+    if (![prefs isKindOfClass:[NSMutableDictionary class]]) prefs = [NSMutableDictionary dictionary];
+    prefs[key] = values ?: @[];
+    NSError *error = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:prefs
+        format:NSPropertyListXMLFormat_v1_0 options:0 error:&error];
+    if (!data) { if (outError) *outError = error; return NO; }
+    if (![data writeToFile:DH_LOADER_PREFS options:NSDataWritingAtomic error:&error]) {
+        if (outError) *outError = error;
+        return NO;
+    }
+    [[NSFileManager defaultManager] setAttributes:@{
+        NSFilePosixPermissions: @0644,
+        NSFileProtectionKey: NSFileProtectionNone,
+    } ofItemAtPath:DH_LOADER_PREFS error:nil];
+    return YES;
+}
+
 static void dh_request_set_enabled(NSArray<NSString *> *values) {
     NSDictionary *req = @{
         @"action": DH_REQ_SET_ENABLED,
@@ -129,31 +170,80 @@ static void dh_request_set_enabled(NSArray<NSString *> *values) {
 
 BOOL DHWriteEnabledBundles(NSSet<NSString *> *bundleIDs, NSError **outError) {
     NSArray *values = [[bundleIDs allObjects] sortedArrayUsingSelector:@selector(compare:)];
-    NSDictionary *plist = @{DH_KEY_BUNDLES: values};
     @try {
-        NSError *error = nil;
-        NSData *data = [NSPropertyListSerialization dataWithPropertyList:plist
-            format:NSPropertyListXMLFormat_v1_0 options:0 error:&error];
-        if (!data) {
-            if (outError) *outError = error;
-            return NO;
-        }
-        // prefs 是管理器自己的权威副本；沙盒目标读不到它，还要再写 jb 配置。
-        if (![data writeToFile:DH_LOADER_PREFS options:NSDataWritingAtomic error:&error]) {
-            if (outError) *outError = error;
-            return NO;
-        }
-        [[NSFileManager defaultManager] setAttributes:@{
-            NSFilePosixPermissions: @0644,
-            NSFileProtectionKey: NSFileProtectionNone,
-        } ofItemAtPath:DH_LOADER_PREFS error:nil];
+        // prefs 是权威副本:读改写(保留 enabledExecutables),写失败即整体失败。
+        if (!dh_write_prefs_key(DH_KEY_BUNDLES, values, outError)) return NO;
         dh_sync_cfprefs(values);
-        (void)dh_try_write_jb_config(data);
+        // 读改写 jb 配置(保留 enabledExecutables),而非整份覆写。
+        (void)dh_write_jb_config_key(DH_KEY_BUNDLES, values);
         dh_request_set_enabled(values);
         return YES;
     } @catch (NSException *e) {
         if (outError) {
             *outError = [NSError errorWithDomain:@"DHManager" code:-12 userInfo:
+                @{NSLocalizedDescriptionKey: e.reason ?: @"写入异常"}];
+        }
+        return NO;
+    }
+}
+
+// rootHide 兜底请求:App 写不动 jb 的 execs 名单时,投 set-execs 请求让 daemon 落盘。
+static BOOL dh_request_set_execs(NSArray<NSString *> *values) {
+    NSDictionary *req = @{
+        @"action": DH_REQ_SET_EXECS,
+        DH_KEY_EXECS: values ?: @[],
+        @"time": @([[NSDate date] timeIntervalSince1970]),
+    };
+    @try {
+        BOOL ok = [req writeToFile:DH_REQUEST_PATH atomically:YES];
+        if (ok) {
+            [[NSFileManager defaultManager] setAttributes:@{
+                NSFilePosixPermissions: @0644,
+                NSFileProtectionKey: NSFileProtectionNone,
+            } ofItemAtPath:DH_REQUEST_PATH error:nil];
+        }
+        return ok;
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
+NSSet<NSString *> *DHReadEnabledExecutables(void) {
+    @try {
+        // prefs 权威优先(与 enabledBundles 一致),回退 jb 配置(companion 读那份)。
+        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:DH_LOADER_PREFS];
+        id value = prefs[DH_KEY_EXECS];
+        if ([value isKindOfClass:[NSArray class]]) return [NSSet setWithArray:value];
+        NSDictionary *jb = [NSDictionary dictionaryWithContentsOfFile:dh_config_path()];
+        value = jb[DH_KEY_EXECS];
+        if ([value isKindOfClass:[NSArray class]]) return [NSSet setWithArray:value];
+    } @catch (__unused NSException *e) {
+    }
+    return [NSSet set];
+}
+
+BOOL DHWriteEnabledExecutables(NSSet<NSString *> *execNames, NSError **outError) {
+    NSArray *values = [[execNames allObjects] sortedArrayUsingSelector:@selector(compare:)];
+    @try {
+        // prefs 存完整副本(含 execs):App 一定写得动自己的 prefs,也让 rootHide 的
+        // updated.sh `cp prefs→config` 把 execs 一并带过去。
+        (void)dh_write_prefs_key(DH_KEY_EXECS, values, NULL);
+        // rootless:App 直接写得动 jb,companion 立刻能读到。
+        if (dh_write_jb_config_key(DH_KEY_EXECS, values)) {
+            return YES;
+        }
+        // rootHide:App 对 jb 是 EPERM,改投请求由 daemon 落盘(异步生效);prefs 已含 execs 兜底。
+        if (dh_request_set_execs(values)) {
+            return YES;
+        }
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"DHManager" code:-13 userInfo:
+                @{NSLocalizedDescriptionKey: @"写入系统进程名单失败(jb 与请求都写不动)"}];
+        }
+        return NO;
+    } @catch (NSException *e) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"DHManager" code:-14 userInfo:
                 @{NSLocalizedDescriptionKey: e.reason ?: @"写入异常"}];
         }
         return NO;
@@ -210,19 +300,32 @@ NSDictionary<NSString *, NSDictionary *> *DHProbeInjectedApps(void) {
             NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
             if (!error && http.statusCode == 200 && data.length) {
                 id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                NSString *bid = nil;
+                NSString *bid = nil, *pname = nil;
+                NSNumber *pidNum = nil;
                 if ([json isKindOfClass:[NSDictionary class]]) {
                     id proc = json[@"process"];
-                    if ([proc isKindOfClass:[NSDictionary class]]) bid = proc[@"bundleId"];
+                    if ([proc isKindOfClass:[NSDictionary class]]) {
+                        bid = proc[@"bundleId"];
+                        pname = proc[@"processName"];   // daemon 反代端口靠它按 execName 匹配
+                        id p = proc[@"pid"];
+                        if ([p isKindOfClass:[NSNumber class]]) pidNum = p;
+                    }
                 }
-                if ([bid isKindOfClass:[NSString class]] && bid.length) {
-                    NSDictionary *info = @{
+                BOOL hasBid = ([bid isKindOfClass:[NSString class]] && bid.length);
+                BOOL hasName = ([pname isKindOfClass:[NSString class]] && pname.length);
+                // App-engine 用 bundleId 归 key;daemon(可能无 bundleId)退回进程名。
+                NSString *key = hasBid ? bid : (hasName ? pname : nil);
+                if (key) {
+                    NSMutableDictionary *info = [@{
                         @"port": @(port),
                         @"version": ([json[@"version"] isKindOfClass:[NSString class]]
                             ? json[@"version"] : @""),
-                    };
+                    } mutableCopy];
+                    if (hasName) info[@"processName"] = pname;
+                    if (hasBid) info[@"bundleId"] = bid;
+                    if (pidNum) info[@"pid"] = pidNum;
                     [lock lock];
-                    found[bid] = info;
+                    found[key] = info;
                     [lock unlock];
                 }
             }
@@ -235,6 +338,27 @@ NSDictionary<NSString *, NSDictionary *> *DHProbeInjectedApps(void) {
     [lock unlock];
     [session invalidateAndCancel];
     return snapshot;
+}
+
+NSString *_Nullable DHLocalLANAddress(void) {
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0) return nil;
+    NSString *preferred = nil;   // en0(WiFi)
+    NSString *fallback = nil;    // 其他非 loopback / 非 link-local
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        char buf[INET_ADDRSTRLEN] = {0};
+        struct sockaddr_in *sin = (struct sockaddr_in *)(void *)ifa->ifa_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof buf)) continue;
+        NSString *ip = [NSString stringWithUTF8String:buf];
+        if (ip.length == 0 || [ip hasPrefix:@"169.254."]) continue;   // link-local(USB)排除
+        NSString *name = ifa->ifa_name ? [NSString stringWithUTF8String:ifa->ifa_name] : @"";
+        if ([name isEqualToString:@"en0"]) { preferred = ip; break; }
+        if (!fallback) fallback = ip;
+    }
+    freeifaddrs(ifaddr);
+    return preferred ?: fallback;
 }
 
 BOOL DHWriteUpdateRequest(NSString *action, NSString *_Nullable version) {

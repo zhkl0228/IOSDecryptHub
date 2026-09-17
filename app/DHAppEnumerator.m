@@ -2,9 +2,11 @@
 
 #import "DHAppEnumerator.h"
 #import "DHConfigStore.h"
+#import "dh_daemons.h"
 #import <dlfcn.h>
 #import <objc/message.h>
 #import <sys/sysctl.h>
+#import <sys/wait.h>
 #import <stdlib.h>
 #import <string.h>
 #import <signal.h>
@@ -417,14 +419,20 @@ static NSString *dh_bundle_executable(NSString *bundlePath) {
     return exec;
 }
 
+// 进程匹配用的可执行名：daemon 直接用 execName（无 bundle），App 从 Info.plist 取。
+static NSString *dh_target_exec(DHAppInfo *app) {
+    if (app.isDaemon && app.execName.length) return app.execName;
+    return dh_bundle_executable(app.bundlePath);
+}
+
 BOOL DHAppProcessRunning(DHAppInfo *app) {
-    NSString *exec = dh_bundle_executable(app.bundlePath);
+    NSString *exec = dh_target_exec(app);
     if (exec.length == 0) return NO;      // 拿不到可执行名就当没在跑：宁可不动作，也不误杀/误启
     return dh_process_running(exec.UTF8String);
 }
 
 BOOL DHKillAppProcess(DHAppInfo *app) {
-    NSString *exec = dh_bundle_executable(app.bundlePath);
+    NSString *exec = dh_target_exec(app);
     if (exec.length == 0) return NO;
     const char *want = exec.UTF8String;
     if (!want || !want[0]) return NO;
@@ -519,4 +527,63 @@ BOOL DHRelaunchApp(NSString *bundleID) {
     if (dh_open_with_workspace(bundleID)) return YES;
     if (dh_open_with_sbs(bundleID)) return YES;
     return dh_open_with_uiopen(bundleID);
+}
+
+#pragma mark - 系统 daemon
+
+NSArray<DHAppInfo *> *DHSystemDaemons(void) {
+    NSMutableArray<DHAppInfo *> *out = [NSMutableArray array];
+    // 从 dh_daemons.h 单一来源展开策展表（exec, display, domain, label, restart）。
+#define DH_DAEMON(exec, disp, dom, lbl, rst)                    \
+    do {                                                        \
+        DHAppInfo *d = [[DHAppInfo alloc] init];               \
+        d.isDaemon = YES;                                       \
+        d.isSystem = YES;                                       \
+        d.showInAll = NO;      /* 只在「系统进程」段出现 */      \
+        d.execName = @exec;                                     \
+        d.name = @disp;                                         \
+        d.launchdDomain = @dom;                                 \
+        d.launchdLabel = @lbl;                                  \
+        d.restartPolicy = @rst;                                 \
+        d.bundleID = @lbl;     /* 用 label 承载,cell 副标题显示 */ \
+        [out addObject:d];                                     \
+    } while (0);
+    DH_DAEMON_LIST(DH_DAEMON)
+#undef DH_DAEMON
+    [out sortUsingComparator:^NSComparisonResult(DHAppInfo *l, DHAppInfo *r) {
+        return [l.name localizedCaseInsensitiveCompare:r.name];
+    }];
+    return out;
+}
+
+BOOL DHRestartDaemon(DHAppInfo *daemon) {
+    if (!daemon.isDaemon || daemon.launchdLabel.length == 0) return NO;
+    NSString *domain = daemon.launchdDomain.length ? daemon.launchdDomain : @"system";
+    NSString *target;
+    if ([domain isEqualToString:@"system"]) {
+        target = [NSString stringWithFormat:@"system/%@", daemon.launchdLabel];
+    } else {
+        // user / gui 域要拼 uid；App 跑在 mobile，getuid() 即目标 daemon 的用户域（501）。
+        target = [NSString stringWithFormat:@"%@/%u/%@", domain, getuid(), daemon.launchdLabel];
+    }
+    NSMutableArray<NSString *> *tools = [NSMutableArray array];
+    NSString *root = dh_manager_jbroot();
+    if (root) [tools addObject:[root stringByAppendingPathComponent:@"usr/bin/launchctl"]];
+    [tools addObject:@"/var/jb/usr/bin/launchctl"];
+    [tools addObject:@"/usr/bin/launchctl"];
+    [tools addObject:@"/bin/launchctl"];
+    for (NSString *tool in tools) {
+        if (access(tool.fileSystemRepresentation, X_OK) != 0) continue;
+        pid_t pid = 0;
+        const char *argv[] = {
+            tool.fileSystemRepresentation, "kickstart", "-k", target.UTF8String, NULL
+        };
+        if (posix_spawn(&pid, argv[0], NULL, NULL, (char * const *)argv, environ) != 0) continue;
+        int status = 0;
+        if (waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return YES;
+        }
+    }
+    // launchctl 走不通时，退回 SIGKILL：带 KeepAlive 的 daemon 会被 launchd 自动重新拉起。
+    return DHKillAppProcess(daemon);
 }
