@@ -4,6 +4,9 @@ build/
 *.dSYM/
 *.o
 
+# 引擎打补丁前的原件备份（可随时从上游重新下载，见 tools/patch_engine_arm64e_pac.py）
+*.pristine
+
 .DS_Store
 *.swp
 .claude/

@@ -150,8 +150,12 @@ build_variant() {
     local ARCHITECTURE="$3"
     local MACHO_ARCHS="$4"
     # 管理器 App 与 updater daemon 是独立进程，arm64 单切片即可运行；
-    # roothide 用胖切片以匹配其全 arm64e 要求。
+    # loader 与引擎则需 arm64e 切片才能注入 arm64e 系统 App。
     local APP_MACHO_ARCHS="${5:-$MACHO_ARCHS}"
+    # 引擎取自哪个 vendor 目录（默认与变体同名）。rootless 也复用 roothide 的胖引擎
+    # （其 arm64e 切片已由 tools/patch_engine_arm64e_pac.py 打过 PAC 补丁），
+    # 这样 Dopamine 等 rootless 越狱也能对系统 App 生效。
+    local ENGINE_VARIANT="${6:-$VARIANT}"
 
     local STAGE="$BUILD_DIR/stage-$VARIANT"
     local DEB_OUT="$BUILD_DIR/${PKG_NAME}_${VERSION}_${VARIANT}.deb"
@@ -160,7 +164,7 @@ build_variant() {
     local DAEMON_OUT="$BUILD_DIR/_daemon-${VARIANT}/$DAEMON_BIN"
     local ENGINE_DYLIB
 
-    ENGINE_DYLIB=$(require_vendor_dylib "$VARIANT" "$MACHO_ARCHS")
+    ENGINE_DYLIB=$(require_vendor_dylib "$ENGINE_VARIANT" "$MACHO_ARCHS")
     compile_loader "$MACHO_ARCHS" "$LOADER_OUT"
     compile_app "$APP_MACHO_ARCHS" "$APP_EXEC"
     compile_daemon "$APP_MACHO_ARCHS" "$DAEMON_OUT"
@@ -488,13 +492,13 @@ mkdir -p "$BUILD_DIR"
 case "$TARGET" in
     all)
         build_variant "rootless" "/var/jb" \
-            "iphoneos-arm64" "arm64" "arm64"
+            "iphoneos-arm64" "arm64 arm64e" "arm64" "roothide"
         build_variant "roothide" "" \
             "iphoneos-arm64e" "arm64 arm64e" "arm64 arm64e"
         ;;
     rootless)
         build_variant "rootless" "/var/jb" \
-            "iphoneos-arm64" "arm64" "arm64"
+            "iphoneos-arm64" "arm64 arm64e" "arm64" "roothide"
         ;;
     roothide)
         build_variant "roothide" "" \
