@@ -160,9 +160,11 @@ compile_collector() {
     done
     info "编译 collector (archs=$ARCHS)..."
     mkdir -p "$(dirname "$OUT")"
+    # collector.c(桥接主体,C)+ collector_http.m(聚合历史查询 HTTP,ObjC,链 Foundation:
+    # 读 cap.jsonl 用 NSJSONSerialization 重建 /api、托管 WebUI、索引页)
     $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
-        -Wall -O2 \
-        "$COLLECTOR_SRC" -o "$OUT"
+        -Wall -O2 -fobjc-arc -framework Foundation \
+        "$COLLECTOR_SRC" "$SCRIPT_DIR/daemon/collector_http.m" -o "$OUT"
 }
 
 # 由 dh_daemons.h 的 DH_DAEMON(exec,...) 单一来源生成 companion 的 Filter → Executables plist。
@@ -276,6 +278,8 @@ CTRL
     cp "$COMPANION_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     cp "$COMPANION_FILTER_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHCompanion.plist"
     cp "$COLLECTOR_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
+    # 引擎 WebUI 快照:collector 历史重建时原样托管(collector 用 _NSGetExecutablePath 定位同目录)。
+    cp "$SCRIPT_DIR/daemon/webui.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/webui.html"
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \

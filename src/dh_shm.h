@@ -26,6 +26,7 @@
 // 对 daemon(设备 2.9GB)可忽略。改此值须 companion 与 collector 一起重建、daemon 重启换新桥。
 #define DH_MAX_CONN    16
 #define DH_LOG_RING_SZ (256u * 1024u) // 引擎日志聚合环大小,必须是 2 的幂
+#define DH_CAP_RING_SZ (512u * 1024u) // 结构化捕获聚合环大小,必须是 2 的幂
 
 // 连接状态:collector 与引擎经 vm_read/write 观察对方,靠这些标志推进。
 enum {
@@ -65,6 +66,13 @@ typedef struct {
     volatile uint32_t log_head;      // companion 生产位置(写入引擎日志字节)
     volatile uint32_t log_tail;      // collector 消费位置(落盘后前移)
     uint8_t log_ring[DH_LOG_RING_SZ];
+    // —— 结构化捕获聚合(P1:严格 daemon 短命,死后仍能富查询)——
+    // companion swizzle -[DHLogStore append:] 把每条 DHLogEntry 序列化成一行 JSON(含引擎自己的
+    // category)写进此环;collector vm_read 落盘 /var/log/dh-<proc>.cap.jsonl(后续入 SQLite + 重建 WebUI)。
+    // 单向 SPSC:cap_head 生产 / cap_tail 消费;满则丢新记录(尽力,不阻塞引擎)。
+    volatile uint32_t cap_head;
+    volatile uint32_t cap_tail;
+    uint8_t cap_ring[DH_CAP_RING_SZ];
 } dh_shm_t;
 
 #endif // DH_SHM_H

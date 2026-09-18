@@ -23,6 +23,9 @@ enum {
     DH_CONN_DATA    = 1,   // 引擎一次 accept 的数据连接
     DH_CONN_LOG     = 2,   // 引擎日志字节流:daemon sandbox 写不了任何文件目录,改由 companion
                            // 把引擎的日志 NSFileHandle 接到本连接,collector 落盘 /var/log/dh-<proc>.log
+    DH_CONN_CAP     = 3,   // 结构化捕获 JSON-lines 流:普通(socket 桥)daemon 的 companion swizzle
+                           // _persist: 把每条 DHLogEntry 序列化后推本连接,collector 落盘
+                           // /var/log/dh-<proc>.cap.jsonl(与内存桥同文件,聚合层统一)。严格 daemon 走 cap_ring。
 };
 
 // 懒连接握手:companion 的 my_accept 建一条 DATA 连接后**阻塞**读这一个字节,

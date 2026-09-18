@@ -175,8 +175,10 @@ static void target_ensure_lan(target_t *t) {
 
 // DH_CONN_LOG:引擎日志字节流(companion 把引擎的 NSFileHandle 接到这条连接)。
 // daemon 自己的 sandbox 写不了任何文件目录,collector 是 root、能写 /var/log,替它落盘。
-static void *log_reader(void *arg) {
-    void **pair = arg; int fd = (int)(long)pair[0]; char *proc = pair[1]; free(pair);
+// companion→collector 的字节流(引擎日志 DH_CONN_LOG 或结构化捕获 DH_CONN_CAP)落盘。
+// pair[0]=fd,pair[1]=strdup(proc),pair[2]=后缀(".log" / ".cap.jsonl",字面量,不 free)。
+static void *file_reader(void *arg) {
+    void **pair = arg; int fd = (int)(long)pair[0]; char *proc = pair[1]; const char *suffix = pair[2]; free(pair);
     // proc 只允许字母数字/._-,防路径注入(getprogname 不会有别的,这里兜底)。
     char safe[DH_PROC_MAX];
     size_t j = 0;
@@ -188,11 +190,11 @@ static void *log_reader(void *arg) {
     safe[j] = 0;
     free(proc);
     if (safe[0] == 0) { close(fd); return NULL; }
-    char path[128];
-    snprintf(path, sizeof path, "/var/log/dh-%s.log", safe);
+    char path[160];
+    snprintf(path, sizeof path, "/var/log/dh-%s%s", safe, suffix);
     int out = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (out < 0) { logts("[collector] 日志文件打开失败 %s errno=%d", path, errno); close(fd); return NULL; }
-    logts("[collector] %s 日志落盘 -> %s", safe, path);
+    if (out < 0) { logts("[collector] 落盘文件打开失败 %s errno=%d", path, errno); close(fd); return NULL; }
+    logts("[collector] %s 落盘 -> %s", safe, path);
     char buf[8192];
     ssize_t n;
     while ((n = read(fd, buf, sizeof buf)) > 0) {
@@ -238,11 +240,13 @@ static void *accept_thread(void *arg) {
             pthread_t th;
             if (pthread_create(&th, NULL, control_reader, pair) == 0) pthread_detach(th);
             else { close(c); free(pair); }
-        } else if (h.type == DH_CONN_LOG) {
-            // 引擎日志字节流:起线程落盘 /var/log/dh-<proc>.log(daemon 自己写不了文件)。
-            void **pair = malloc(2 * sizeof(void *)); pair[0] = (void *)(long)c; pair[1] = strdup(h.proc);
+        } else if (h.type == DH_CONN_LOG || h.type == DH_CONN_CAP) {
+            // 引擎日志(.log)/ 结构化捕获(.cap.jsonl)字节流:起线程落盘(daemon 自己写不了文件)。
+            void **pair = malloc(3 * sizeof(void *));
+            pair[0] = (void *)(long)c; pair[1] = strdup(h.proc);
+            pair[2] = (h.type == DH_CONN_CAP) ? (void *)".cap.jsonl" : (void *)".log";
             pthread_t th;
-            if (pthread_create(&th, NULL, log_reader, pair) == 0) pthread_detach(th);
+            if (pthread_create(&th, NULL, file_reader, pair) == 0) pthread_detach(th);
             else { close(c); free(pair[1]); free(pair); }
         } else { // DATA
             target_ensure_lan(t);
@@ -420,9 +424,32 @@ static void *mb_conn_thread(void *arg) {
 
 typedef struct { char proc[DH_PROC_MAX]; int pid; int lan_port; mach_port_t task; uint64_t shm; int lan_fd; } mb_target_t;
 
-// 内存桥日志落盘:严格 daemon 的引擎日志走不了 socket,companion 把日志字节写进 g_dh_shm.log_ring,
-// 本线程 vm_read 出来落盘 /var/log/dh-<proc>.log(与 socket 桥的 log_reader 同命名)。task 失效
-// (daemon 退出 / 桥被 teardown)即退出。单消费者:只有本线程读 log_ring 并前移 log_tail。
+// 抽一条内存桥单向环(companion 生产 head / collector 消费 tail)落到 out_fd。失同步(读到垃圾/丢
+// 数据、avail 超过环容量)即跳到 head 丢弃这段(防狂写)。返回 -1 = task 失效(mb_rd 失败),调用方收尾退出。
+static int mb_drain(mach_port_t task, uint64_t base, size_t head_off, size_t tail_off,
+                    size_t ring_off, uint32_t ring_sz, uint32_t *tail, int out_fd) {
+    uint32_t head = 0;
+    if (mb_rd(task, base + head_off, &head, 4) != 0) return -1;
+    if ((uint32_t)(head - *tail) > ring_sz) { *tail = head; mb_wr(task, base + tail_off, tail, 4); }
+    uint8_t buf[8192];
+    while ((int32_t)(head - *tail) > 0) {
+        uint32_t k = head - *tail; if (k > sizeof buf) k = (uint32_t)sizeof buf;
+        uint32_t pos = *tail & (ring_sz - 1);
+        uint32_t first = (pos + k <= ring_sz) ? k : (ring_sz - pos);
+        if (mb_rd(task, base + ring_off + pos, buf, first) != 0) return -1;
+        if (k > first && mb_rd(task, base + ring_off, buf + first, k - first) != 0) return -1;
+        ssize_t off = 0;
+        while (off < (ssize_t)k) { ssize_t w = write(out_fd, buf + off, (size_t)(k - off)); if (w <= 0) break; off += w; }
+        *tail += k;
+        mb_wr(task, base + tail_off, tail, 4);
+        if (mb_rd(task, base + head_off, &head, 4) != 0) return -1;
+    }
+    return 0;
+}
+
+// 内存桥落盘:严格 daemon 的引擎日志/结构化捕获走不了 socket,companion 写进 g_dh_shm 的 log_ring /
+// cap_ring,本线程 vm_read 落 /var/log/dh-<proc>.log 与 dh-<proc>.cap.jsonl。每轮先校验 magic(端口
+// 复用防读垃圾狂写),task 失效即退出。单消费者:只有本线程读这两环并前移各自 tail。
 static void *mb_log_thread(void *arg) {
     mb_target_t *t = arg;
     char safe[DH_PROC_MAX]; size_t j = 0;
@@ -436,41 +463,24 @@ static void *mb_log_thread(void *arg) {
     char path[128]; snprintf(path, sizeof path, "/var/log/dh-%s.log", safe);
     int out = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (out < 0) { logts("[collector] %s 内存桥日志打开失败 %s errno=%d", safe, path, errno); return NULL; }
-    logts("[collector] %s 内存桥日志落盘 -> %s", safe, path);
+    char cpath[160]; snprintf(cpath, sizeof cpath, "/var/log/dh-%s.cap.jsonl", safe);
+    int capf = open(cpath, O_WRONLY | O_CREAT | O_APPEND, 0644);   // 结构化捕获(可选,失败不致命)
+    logts("[collector] %s 内存桥落盘 -> %s%s", safe, path, capf >= 0 ? " (+cap.jsonl)" : "(cap open 失败)");
     uint64_t base = t->shm;
-    uint32_t tail = 0;
-    mb_rd(t->task, base + offsetof(dh_shm_t, log_tail), &tail, 4);   // 续上次(通常 0)
-    uint8_t buf[8192];
+    uint32_t ltail = 0, ctail = 0;
+    mb_rd(t->task, base + offsetof(dh_shm_t, log_tail), &ltail, 4);
+    if (capf >= 0) mb_rd(t->task, base + offsetof(dh_shm_t, cap_tail), &ctail, 4);
     for (;;) {
-        // 存活校验:daemon 退出 / 桥被 teardown 后,task 端口可能被复用 → mb_rd 会读到别的进程内存
-        // (垃圾)。校验 magic 仍在,失配即认为本 target 已失效并退出;否则会把垃圾当日志狂写(实测
-        // mobileactivationd 桥重建时旧线程读到垃圾 head → 104MB 垃圾文件)。
         uint32_t mg = 0;
         if (mb_rd(t->task, base + offsetof(dh_shm_t, magic), &mg, 4) != 0 || mg != DH_SHM_MAGIC) break;
-        uint32_t head = 0;
-        if (mb_rd(t->task, base + offsetof(dh_shm_t, log_head), &head, 4) != 0) break;   // task 失效
-        // 反同步钳制:ring 物理上最多 DH_LOG_RING_SZ 个未读字节;avail 超过必是读到垃圾或丢了数据,
-        // 跳到 head(丢弃这段),防狂写。
-        if ((uint32_t)(head - tail) > DH_LOG_RING_SZ) {
-            tail = head;
-            mb_wr(t->task, base + offsetof(dh_shm_t, log_tail), &tail, 4);
-        }
-        while ((int32_t)(head - tail) > 0) {
-            uint32_t avail = head - tail;
-            uint32_t k = avail < sizeof buf ? avail : (uint32_t)sizeof buf;
-            uint32_t pos = tail & (DH_LOG_RING_SZ - 1);
-            uint32_t first = (pos + k <= DH_LOG_RING_SZ) ? k : (DH_LOG_RING_SZ - pos);
-            if (mb_rd(t->task, base + offsetof(dh_shm_t, log_ring) + pos, buf, first) != 0) { close(out); return NULL; }
-            if (k > first && mb_rd(t->task, base + offsetof(dh_shm_t, log_ring), buf + first, k - first) != 0) { close(out); return NULL; }
-            ssize_t off = 0;
-            while (off < (ssize_t)k) { ssize_t w = write(out, buf + off, (size_t)(k - off)); if (w <= 0) break; off += w; }
-            tail += k;
-            mb_wr(t->task, base + offsetof(dh_shm_t, log_tail), &tail, 4);
-            if (mb_rd(t->task, base + offsetof(dh_shm_t, log_head), &head, 4) != 0) { close(out); return NULL; }
-        }
+        if (mb_drain(t->task, base, offsetof(dh_shm_t, log_head), offsetof(dh_shm_t, log_tail),
+                     offsetof(dh_shm_t, log_ring), DH_LOG_RING_SZ, &ltail, out) != 0) break;
+        if (capf >= 0 && mb_drain(t->task, base, offsetof(dh_shm_t, cap_head), offsetof(dh_shm_t, cap_tail),
+                                  offsetof(dh_shm_t, cap_ring), DH_CAP_RING_SZ, &ctail, capf) != 0) break;
         usleep(200000);   // 200ms 轮询
     }
     close(out);
+    if (capf >= 0) close(capf);
     return NULL;
 }
 
@@ -611,9 +621,25 @@ static void *mem_bridge_manager(void *arg) {
     return NULL;
 }
 
+// —— 供聚合 HTTP 模块(collector_http.m)调用的桥接 ——
+void dh_log(const char *s) { logts("%s", s); }
+
+// proc 当前是否有活桥(内存桥 g_mb 或 socket 桥 g_t.online),有则回其 LAN 端口。无锁读:g_mb 结构
+// 故意不 free(见 mb_teardown),g_t 槽复用但 proc/online 是良性竞态,索引页用途容忍瞬时不一致。
+int dh_bridge_online(const char *proc, int *lan_port) {
+    for (int i = 0; i < g_mb_n; i++)
+        if (strcmp(g_mb[i]->proc, proc) == 0) { if (lan_port) *lan_port = g_mb[i]->lan_port; return 1; }
+    for (int i = 0; i < MAX_TARGETS; i++)
+        if (g_t[i].used && g_t[i].online && strcmp(g_t[i].proc, proc) == 0) { if (lan_port) *lan_port = g_t[i].lan_port; return 1; }
+    return 0;
+}
+
+extern void dh_agg_http_start(void);   // 聚合历史查询 HTTP 服务(collector_http.m),内部起线程即返回
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     { pthread_t mbt; if (pthread_create(&mbt, NULL, mem_bridge_manager, NULL) == 0) pthread_detach(mbt); }
+    dh_agg_http_start();   // 聚合口(8089):索引页 + per-daemon 历史重建(死 daemon 仍可富查询)
     unlink(DH_BRIDGE_SOCK);
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ls < 0) { logts("[collector] socket 失败 errno=%d", errno); return 1; }

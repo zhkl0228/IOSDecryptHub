@@ -26,6 +26,7 @@
 #import <poll.h>
 #import <mach-o/dyld.h>
 #import <objc/runtime.h>
+#import <objc/message.h>   // objc_msgSend(回填 backlog:+[DHLogStore shared] / -snapshot)
 #import "dh_bridge.h"
 #import "dh_daemons.h"
 #import "dh_shared.h"   // DH_KEY_EXECS(与 manager 共享的名单 key)
@@ -253,6 +254,119 @@ static void my_openLogHandleLocked(id self, SEL _cmd) {
 
 static void my_rotateLocked(id self, SEL _cmd) { (void)self; (void)_cmd; /* socket 不可 rotate */ }
 
+// —— 结构化捕获聚合(P1)——
+// 引擎每条捕获经 -[DHLogStore append:](self,entry) 进来,entry 是 DHLogEntry(getter 全齐,IDA 确认)。
+// swizzle 它:先让引擎照常处理,再读 entry 字段(含引擎自己的 category)序列化成一行 JSON,写进
+// g_dh_shm.cap_ring;collector vm_read 落盘 /var/log/dh-<proc>.cap.jsonl。仅内存桥 daemon(P1 目标;
+// socket 桥 P2 走 DH_CONN_CAP)。大 payload 截断到 8K(记原长,全量留 P3)。
+@interface DHLogEntry : NSObject
+- (NSInteger)category;
+- (NSString *)algorithm;
+- (NSString *)operation;
+- (NSData *)input;
+- (NSData *)output;
+- (id)callStack;
+- (NSString *)detail;
+- (long long)timestampMs;
+- (long long)threadId;
+- (long long)seq;   // 引擎单调递增序号(唯一);回填与流式并集靠它去重
+- (NSData *)key;              // 对称密钥(IDA 确认 NSData*);crypto 分析核心料
+- (NSData *)iv;               // 初始向量(NSData*)
+- (NSString *)publicKeyInfo;  // 非对称公钥信息(NSString*)
+@end
+
+// 把整条记录(JSON+换行)写进 cap_ring;放不下则整条丢弃(保持行边界,尽力不阻塞引擎)。
+// 加锁:流式经 _persist:(引擎串行队列,彼此串行),但一次性 backlog 回填跑在 dlopen 线程,会与
+// 队列上的 _persist: 并发写 cap_head,故整个入环操作上锁。序列化(JSON/base64)在锁外,不占锁。
+static pthread_mutex_t g_cap_lock = PTHREAD_MUTEX_INITIALIZER;
+static void dh_cap_push(const uint8_t *data, uint32_t n) {
+    if (n == 0 || n > DH_CAP_RING_SZ) return;
+    pthread_mutex_lock(&g_cap_lock);
+    uint32_t space = DH_CAP_RING_SZ - (g_dh_shm.cap_head - g_dh_shm.cap_tail);
+    if (n <= space) {
+        uint32_t pos = g_dh_shm.cap_head & (DH_CAP_RING_SZ - 1);
+        uint32_t first = (pos + n <= DH_CAP_RING_SZ) ? n : (DH_CAP_RING_SZ - pos);
+        memcpy(&g_dh_shm.cap_ring[pos], data, first);
+        if (n > first) memcpy(&g_dh_shm.cap_ring[0], data + first, n - first);
+        g_dh_shm.cap_head += n;
+    }
+    pthread_mutex_unlock(&g_cap_lock);
+}
+
+// socket 桥(普通 daemon):把一行捕获 JSON 推给 collector 的 DH_CONN_CAP 连接,collector 落
+// /var/log/dh-<proc>.cap.jsonl(与内存桥同文件)。懒连接;写失败即关 fd 下次重连(这条丢,尽力聚合)。
+// fd 由 dh_connect 标记为内部,免被引擎网络 hook 当成 daemon 网络活动捕获。
+static int g_cap_fd = -1;
+static pthread_mutex_t g_cap_sock_lock = PTHREAD_MUTEX_INITIALIZER;
+static void dh_cap_sock_write(const uint8_t *data, uint32_t n) {
+    pthread_mutex_lock(&g_cap_sock_lock);
+    if (g_cap_fd < 0) g_cap_fd = dh_connect(DH_CONN_CAP);
+    if (g_cap_fd >= 0) {
+        uint32_t off = 0;
+        while (off < n) {
+            ssize_t w = write(g_cap_fd, data + off, n - off);
+            if (w <= 0) { close(g_cap_fd); g_cap_fd = -1; break; }
+            off += (uint32_t)w;
+        }
+    }
+    pthread_mutex_unlock(&g_cap_sock_lock);
+}
+
+// 序列化一条 DHLogEntry → 一行 JSON → cap_ring。my_append(流式)与 swizzle 时的 backlog 回填共用。
+// 存引擎原始 category 整数,不 clamp:引擎 dh_log_category_count()=9,名字表
+// {0 digest,1 hmac,2 sym,3 asym,4 file,5 sys,6 net,7 keychain,8 other},category_from_string
+// 未匹配返回 -1。名字映射(idx<=8 用表,否则 "other")照抄引擎、放 collector 重建层,这里只忠实
+// 记原值——否则日后引擎加类 / 出现 -1 会被静默折成 other,真值永久丢失(IDA 1.27.3 确认)。
+static void dh_cap_emit(id entryObj) {
+    if (!entryObj) return;
+    @autoreleasepool {
+        DHLogEntry *e = (DHLogEntry *)entryObj;
+        NSData *in = [e input]; NSData *out = [e output];
+        NSUInteger inLen = in ? in.length : 0, outLen = out ? out.length : 0;
+        const NSUInteger CAP = 8192;
+        NSString *inB64  = in  ? [[in  subdataWithRange:NSMakeRange(0, MIN(inLen,  CAP))] base64EncodedStringWithOptions:0] : @"";
+        NSString *outB64 = out ? [[out subdataWithRange:NSMakeRange(0, MIN(outLen, CAP))] base64EncodedStringWithOptions:0] : @"";
+        id cs = [e callStack];
+        NSString *csStr = [cs isKindOfClass:[NSArray class]]  ? [(NSArray *)cs componentsJoinedByString:@"\n"]
+                        : [cs isKindOfClass:[NSString class]] ? (NSString *)cs
+                        : (cs ? [cs description] : @"");
+        NSMutableDictionary *rec = [@{
+            @"seq": @([e seq]),
+            @"cat": @([e category]),
+            @"algo": ([e algorithm] ?: @""),
+            @"op": ([e operation] ?: @""),
+            @"detail": ([e detail] ?: @""),
+            @"inLen": @(inLen), @"outLen": @(outLen),
+            @"in": inB64, @"out": outB64,
+            @"cs": csStr,
+            @"tsMs": @([e timestampMs]),
+            @"tid": @([e threadId]),
+        } mutableCopy];
+        // crypto 料(key/iv/publicKeyInfo)——本 fork 分析核心,仅非空时写入以保持记录紧凑。
+        NSData *key = [e key]; NSData *iv = [e iv]; NSString *pki = [e publicKeyInfo];
+        if (key.length) rec[@"key"] = [[key subdataWithRange:NSMakeRange(0, MIN(key.length, CAP))] base64EncodedStringWithOptions:0];
+        if (iv.length)  rec[@"iv"]  = [[iv  subdataWithRange:NSMakeRange(0, MIN(iv.length,  CAP))] base64EncodedStringWithOptions:0];
+        if (pki.length) rec[@"pki"] = pki;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
+        if (!json) return;
+        NSMutableData *line = [NSMutableData dataWithData:json];
+        [line appendBytes:"\n" length:1];
+        // 分流:严格 daemon(内存桥)写 cap_ring 由 collector vm_read;普通 daemon(socket 桥)推
+        // DH_CONN_CAP 由 collector 落盘。同一条 JSON-lines 格式,collector/聚合层统一处理。
+        if (g_mem_bridge) dh_cap_push(line.bytes, (uint32_t)line.length);
+        else              dh_cap_sock_write(line.bytes, (uint32_t)line.length);
+    }
+}
+
+// 挂 _persist: 而非 append::append: 跑在调用线程(可并发)且在 setSeq: 之前——那时读 [e seq] 恒为 0。
+// _persist: 在引擎串行队列上、setSeq: 之后被调用(IDA 1.27.3 确认:block_invoke 里先 ++seq/setSeq: 再
+// _persist:),此处 seq 已就绪且 _persist: 彼此串行。语义上它就是引擎落盘点,聚合挂这里最自然。
+static void (*orig_persist)(id, SEL, id);
+static void my_persist(id self, SEL _cmd, id entryObj) {
+    if (orig_persist) orig_persist(self, _cmd, entryObj);   // 先让引擎正常落盘(flat 日志/WebUI 照旧)
+    dh_cap_emit(entryObj);                                  // 两桥都聚合:dh_cap_emit 内按桥型分流
+}
+
 static void dh_swizzle_logstore(void) {
     static bool done = false;
     if (done) return;   // 只 swizzle 一次(dh_img_added 早触发 + dlopen 后兜底,取先成功的)
@@ -266,7 +380,23 @@ static void dh_swizzle_logstore(void) {
     }
     Method m2 = class_getInstanceMethod(cls, NSSelectorFromString(@"_rotateLocked"));
     if (m2) method_setImplementation(m2, (IMP)my_rotateLocked);
-    syslog(LOG_NOTICE, TAG " 已重定向 DHLogStore 落盘 -> collector(/var/log)");
+    Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(@"_persist:"));   // 结构化捕获聚合
+    if (m3) {
+        orig_persist = (void (*)(id, SEL, id))method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)my_persist);
+        // 回填 backlog:引擎在本 swizzle 装上之前(dlopen/init 期)已 persist 若干条(实测 mobileactivationd
+        // 启动即 5 条 sys),这些没经 _persist: 入口。短命 daemon 死后它们永久丢失,故这里一次性 snapshot
+        // 补进 cap_ring。带 seq,与流式的并集由 collector 重建层按 seq 去重(无损、确定)。仅内存桥(P1)。
+        if (g_mem_bridge) {
+            id store = ((id (*)(id, SEL))objc_msgSend)((id)cls, NSSelectorFromString(@"shared"));
+            id backlog = store ? ((id (*)(id, SEL))objc_msgSend)(store, NSSelectorFromString(@"snapshot")) : nil;
+            if ([backlog isKindOfClass:[NSArray class]]) {
+                for (id e in (NSArray *)backlog) dh_cap_emit(e);
+                syslog(LOG_NOTICE, TAG " swizzle _persist: + 回填 backlog %lu 条", (unsigned long)[(NSArray *)backlog count]);
+            }
+        }
+    }
+    syslog(LOG_NOTICE, TAG " 已重定向 DHLogStore 落盘 -> collector + swizzle _persist:(结构化捕获)");
 }
 
 // 引擎的悬浮窗(DHFloatingController)给 App 显示 ip:port;daemon 里没有可用的 UIWindowScene,
