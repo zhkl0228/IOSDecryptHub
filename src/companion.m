@@ -50,10 +50,22 @@ static int g_engine_fd = -1;         // 引擎 WebUI 监听 socket 的 fd
 static dh_shm_t g_dh_shm;          // collector 扫 DHCompanion 镜像找 magic 定位本结构
 static bool g_mem_bridge = false;
 
+// 把 fd 标记为引擎内部,免得 1.27.x 引擎的网络 hook 把 companion 自己连 collector 的连接当成目标
+// daemon 的网络活动捕获(实测 socket 桥 8090 的 WebUI 网络 tab 被 dh_connect 的 AF_UNIX connect 刷屏)。
+// dh_net_mark_internal_fd 是引擎导出符号(1.27.x+,置 g_dh_fd_state[fd]=2);1.25.6 无此符号则跳过。
+// 惰性 dlsym:引擎 dlopen 后才解析得到,故不缓存失败、每次未命中重试。
+static void dh_mark_internal_fd(int fd) {
+    static void (*fn)(int) = NULL;
+    if (!fn) fn = (void (*)(int))dlsym(RTLD_DEFAULT, "dh_net_mark_internal_fd");
+    if (fn) fn(fd);
+}
+
 // 连到 collector,发定长头,返回连接 fd(失败 -1)。
 static int dh_connect(uint8_t type) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    dh_mark_internal_fd(fd);   // 标记内部,免被引擎网络 hook 捕获(见上)
+
     struct sockaddr_un u;
     memset(&u, 0, sizeof u);
     u.sun_family = AF_UNIX;
