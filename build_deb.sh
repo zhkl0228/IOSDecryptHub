@@ -330,9 +330,14 @@ DEFAULT_PATH="${PREFIX}/usr/lib/IOSDecryptHub/enabledBundles.default.plist"
 LEGACY_PATH="/var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist"
 mkdir -p "\$CONFIG_DIR"
 LOADER_PREFS="/var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist"
-# 沙盒目标读 jb 这份。升级时以 prefs 覆盖，避免开关已开却仍用旧 jb 名单。
+# 沙盒目标读 jb 这份。默认以 prefs(管理器 UI 写的) 为准; 但如果 jb 侧配置比 prefs 新,
+# 说明有人直接改了 jb 文件(运维/脚本), 就反向同步回 prefs —— 否则手动加的 App 会被静默还原。
 if [ -f "\$LOADER_PREFS" ]; then
-    cp "\$LOADER_PREFS" "\$CONFIG_PATH"
+    if [ -f "\$CONFIG_PATH" ] && [ "\$CONFIG_PATH" -nt "\$LOADER_PREFS" ]; then
+        cp "\$CONFIG_PATH" "\$LOADER_PREFS"
+    else
+        cp "\$LOADER_PREFS" "\$CONFIG_PATH"
+    fi
 elif [ ! -f "\$CONFIG_PATH" ]; then
     if [ -f "\$LEGACY_PATH" ]; then
         cp "\$LEGACY_PATH" "\$CONFIG_PATH"
