@@ -31,11 +31,23 @@
     DH_DAEMON("akd",               "Apple 账户(AuthKit)","user",  "com.apple.akd",               "kickstart") \
     DH_DAEMON("accountsd",         "账户",              "user",   "com.apple.accountsd",         "kickstart") \
     DH_DAEMON("devicecheckd",      "设备认证",          "user",   "com.apple.devicecheckd",      "kickstart") \
-    DH_DAEMON("locationd",         "定位",              "system", "com.apple.locationd",         "kickstart")
-// 评估后未纳入(实测 2026-09,sandbox 禁 network-outbound、桥的 connect-out 被 deny,数据出不来):
-//   securityd(uid64) / trustd(uid282) / mobileactivationd / lockdownd。
-//   companion 能注入且不崩,但每 2s 重连会刷 sandbox deny 日志,故不放进白名单。
-//   要拿这类严格 daemon 的数据需换数据出口(mach service / 共享内存等),成本高,另议。
+    DH_DAEMON("locationd",         "定位",              "system", "com.apple.locationd",         "kickstart") \
+    DH_DAEMON("securityd",         "安全(securityd)",   "system", "com.apple.securityd",         "kickstart") \
+    DH_DAEMON("trustd",            "证书信任(trustd)",  "system", "com.apple.trustd",            "kickstart") \
+    DH_DAEMON("mobileactivationd", "设备激活",          "system", "com.apple.mobileactivationd", "kickstart") \
+    DH_DAEMON("lockdownd",         "锁定(lockdownd)",   "system", "com.apple.mobile.lockdown",   "kickstart")
+// securityd/trustd/mobileactivationd/lockdownd:sandbox 禁 network-outbound(连带 mach-lookup),
+// socket/mach 出口全封 → 走**内存桥**:companion 注入后 connect collector 不通即自动切内存桥
+// (引擎 accept 得真 socketpair,pump 线程搬到 g_dh_shm ring),collector task_for_pid + vm_read/write
+// 反读该 ring 并 bind LAN 端口。securityd 已端到端跑通(/api + 139KB WebUI + diag,不崩);见 dh_shm.h。
+// 实测坑(2026-09,iPad iOS18.5):
+//   * trustd 进程 uid 282,但 launchd 服务在 system 域(非 user/282),label com.apple.trustd。
+//   * mobileactivationd 名长 17 > MAXCOMLEN(16),collector 侧 p_comm 会截成 "mobileactivation";
+//     mem_bridge_manager 用 strncmp(p_comm, exec, MAXCOMLEN) 定位后,一律改用列表里的完整 exec 名。
+//   * lockdownd(/usr/libexec/lockdownd)uid 0、launchd 在 **system 域**、label
+//     com.apple.mobile.lockdown(plist 在 /System/Library/LaunchDaemons);此前误标 user/501,
+//     kickstart user/501/... 那个服务不存在,pid 不变=没重启。正解 system/com.apple.mobile.lockdown,
+//     实测 pid 会变(1669→新)才算真重启,companion 才会重新注入。
 
 // 绝不注入(崩了进不去系统)。companion 自检兜底,与 loader 的 dh_is_blocked 精神一致。
 #define DH_DAEMON_HARD_BLOCK(X) \

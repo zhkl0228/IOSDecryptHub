@@ -471,7 +471,7 @@ POSTRM
     ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
-    ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
+    ldid -S"$SCRIPT_DIR/daemon/collector_entitlements.plist" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
 
     cp -R "$STAGE/." "$PKG_STAGE/"
     find "$PKG_STAGE" -type d -exec chmod 0755 {} +

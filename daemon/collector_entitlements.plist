@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 内存桥反读/反写严格 daemon 内存需要 task port（越狱 AMFI 不校验来源，fake 也认） -->
+    <key>com.apple.system-task-ports</key><true/>
+    <key>task_for_pid-allow</key><true/>
+    <key>platform-application</key><true/>
+</dict>
+</plist>

@@ -21,12 +21,14 @@
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <netinet/in.h>
+#import <poll.h>
 #import <mach-o/dyld.h>
 #import <objc/runtime.h>
 #import "fishhook.h"
 #import "dh_bridge.h"
 #import "dh_daemons.h"
 #import "dh_shared.h"   // DH_KEY_EXECS(与 manager 共享的名单 key)
+#import "dh_shm.h"      // 内存桥(严格 daemon:sandbox 全封 socket 出口时用)
 
 #define TAG "[DHCompanion]"
 
@@ -41,6 +43,11 @@ static int (*real_bind)(int, const struct sockaddr *, socklen_t);
 static int (*real_listen)(int, int);
 static int (*real_accept)(int, struct sockaddr *, socklen_t *);
 static int g_engine_fd = -1;         // 引擎 WebUI 监听 socket 的 fd
+
+// —— 内存桥(g_mem_bridge=true 时启用;collector connect-out 被 sandbox 拒的严格 daemon)——
+// 引擎 accept 得到真 socketpair fd,companion pump 线程搬运到 g_dh_shm ring;collector vm_read/write 它。
+static dh_shm_t g_dh_shm;          // collector 扫 DHCompanion 镜像找 magic 定位本结构
+static bool g_mem_bridge = false;
 
 // 连到 collector,发定长头,返回连接 fd(失败 -1)。
 static int dh_connect(uint8_t type) {
@@ -68,7 +75,8 @@ static int my_bind(int s, const struct sockaddr *a, socklen_t l) {
         int port = ntohs(((const struct sockaddr_in *)a)->sin_port);
         if (port >= 8088 && port <= 8108) {   // 引擎 WebUI 端口区,假装 bind 成功
             g_engine_fd = s;
-            syslog(LOG_NOTICE, TAG " 拦截引擎 bind(:%d)-> 假成功 fd=%d", port, s);
+            if (g_mem_bridge) g_dh_shm.engine_port = (uint32_t)port;
+            syslog(LOG_NOTICE, TAG " 拦截引擎 bind(:%d)-> 假成功 fd=%d%s", port, s, g_mem_bridge ? "(内存桥)" : "");
             return 0;
         }
     }
@@ -78,17 +86,86 @@ static int my_listen(int s, int b) {
     if (s == g_engine_fd) { syslog(LOG_NOTICE, TAG " 拦截引擎 listen fd=%d", s); return 0; }
     return real_listen ? real_listen(s, b) : -1;
 }
+
+// —— 内存桥:引擎 accept 得到**真 socketpair fd**(poll/read/write 全正常),companion pump 线程在
+// socketpair ↔ g_dh_shm ring 之间搬运,collector 经 vm_read/write 与 ring 交换字节。
+// (引擎 HTTP serve 用 poll/select 等 fd 可读,虚拟 fd 内核不认——实测 accept 认领后不 read,故必须给真 fd。)
+typedef struct { int b; int idx; } dh_pump_arg_t;
+static void *dh_mem_pump(void *arg) {
+    dh_pump_arg_t pa = *(dh_pump_arg_t *)arg; free(arg);
+    int b = pa.b; dh_conn_t *c = &g_dh_shm.conn[pa.idx];
+    uint8_t buf[16384]; int wr_shut = 0;
+    for (;;) {
+        int did = 0;
+        struct pollfd p = { b, POLLIN, 0 };
+        int pr = poll(&p, 1, 5);
+        if (pr > 0 && (p.revents & POLLIN)) {          // 引擎响应:socketpair → out 环
+            ssize_t n = read(b, buf, sizeof buf);
+            if (n > 0) {
+                uint32_t sent = 0;
+                while (sent < (uint32_t)n) {
+                    uint32_t space = DH_RING_SZ - (c->out_head - c->out_tail);
+                    if (space == 0) { usleep(1000); continue; }
+                    uint32_t k = ((uint32_t)n - sent) < space ? ((uint32_t)n - sent) : space;
+                    uint32_t pos = c->out_head & (DH_RING_SZ - 1);
+                    uint32_t first = (pos + k <= DH_RING_SZ) ? k : (DH_RING_SZ - pos);
+                    memcpy(&c->out[pos], buf + sent, first);
+                    if (k > first) memcpy(&c->out[0], buf + sent + first, k - first);
+                    c->out_head += k; sent += k;
+                }
+                did = 1;
+            } else { c->engine_closed = 1; break; }    // 引擎关连接
+        }
+        uint32_t avail = c->in_head - c->in_tail;      // collector 请求:in 环 → socketpair
+        if (avail) {
+            uint32_t k = avail < sizeof buf ? avail : (uint32_t)sizeof buf;
+            uint32_t pos = c->in_tail & (DH_RING_SZ - 1);
+            uint32_t first = (pos + k <= DH_RING_SZ) ? k : (DH_RING_SZ - pos);
+            memcpy(buf, &c->in[pos], first);
+            if (k > first) memcpy(buf + first, &c->in[0], k - first);
+            ssize_t w = write(b, buf, k);
+            if (w > 0) { c->in_tail += (uint32_t)w; did = 1; }
+        }
+        if (c->lan_closed && !wr_shut) { shutdown(b, SHUT_WR); wr_shut = 1; }   // LAN 关 → 引擎 read EOF
+        if (pr > 0 && (p.revents & (POLLHUP | POLLERR | POLLNVAL))) { c->engine_closed = 1; break; }
+        if (!did) usleep(1000);
+    }
+    close(b);
+    return NULL;
+}
+// 引擎侧认领锁:若引擎用多线程 accept,两线程可能同时扫到同一条 REQ 都认领 → 与 collector 侧同类
+// 的串味。锁内「扫 REQ + 置 SERVING」原子认领(单线程 accept 时无竞争,加锁也无害)。
+static pthread_mutex_t g_dh_accept_lock = PTHREAD_MUTEX_INITIALIZER;
+static int dh_mem_accept(void) {
+    int idx = -1;
+    for (;;) {   // 等 collector 占用一条连接(state=REQ)
+        pthread_mutex_lock(&g_dh_accept_lock);
+        idx = -1;
+        for (int i = 0; i < DH_MAX_CONN; i++) if (g_dh_shm.conn[i].state == DH_CS_REQ) { idx = i; break; }
+        if (idx >= 0) g_dh_shm.conn[idx].state = DH_CS_SERVING;   // 锁内认领,防多 accept 线程抢同一条
+        pthread_mutex_unlock(&g_dh_accept_lock);
+        if (idx >= 0) break;
+        usleep(2000);
+    }
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { g_dh_shm.conn[idx].state = DH_CS_FREE; errno = ECONNABORTED; return -1; }
+    dh_pump_arg_t *pa = malloc(sizeof *pa); pa->b = sv[1]; pa->idx = idx;
+    pthread_t th;
+    if (pthread_create(&th, NULL, dh_mem_pump, pa) != 0) {
+        close(sv[0]); close(sv[1]); free(pa); g_dh_shm.conn[idx].state = DH_CS_FREE; errno = ECONNABORTED; return -1;
+    }
+    pthread_detach(th);
+    return sv[0];   // 引擎用真 socketpair fd
+}
 static int my_accept(int s, struct sockaddr *a, socklen_t *l) {
     if (s == g_engine_fd) {
-        // 懒连接:开一条 DATA 连接后**阻塞**读 collector 的 go(见 dh_bridge.h)。
-        // collector 只在真有 LAN 客户端要 splice 时才发 go,所以引擎的 accept 停在这里等待、
-        // 不空转洪泛;收到 go 即表示这条连接马上有真实 HTTP 请求,引擎照常在该 fd 上 serve。
+        if (g_mem_bridge) return dh_mem_accept();
+        // socket 桥懒连接:开一条 DATA 连接后**阻塞**读 collector 的 go(见 dh_bridge.h)。
         int fd = dh_connect(DH_CONN_DATA);
         if (fd < 0) { errno = ECONNABORTED; return -1; }
         char go = 0;
         ssize_t r = read(fd, &go, 1);
         if (r != 1 || (unsigned char)go != DH_BRIDGE_GO) {
-            // 连接被 collector 关闭(如目标下线清池)或收到异常字节:放弃这条,引擎会重试 accept。
             close(fd);
             errno = ECONNABORTED;
             return -1;
@@ -136,6 +213,24 @@ static void dh_swizzle_logstore(void) {
     Method m2 = class_getInstanceMethod(cls, NSSelectorFromString(@"_rotateLocked"));
     if (m2) method_setImplementation(m2, (IMP)my_rotateLocked);
     syslog(LOG_NOTICE, TAG " 已重定向 DHLogStore 落盘 -> collector(/var/log)");
+}
+
+// 引擎的悬浮窗(DHFloatingController)给 App 显示 ip:port;daemon 里没有可用的 UIWindowScene,
+// -[DHFloatingController createFloatingWindow] 落到 initWithFrame: 分支后,系统为无 scene 的
+// UIWindow 自建 UIWindowScene 会断言崩(实测 trustd 注入即 SIGABRT)。companion 只注入 daemon,
+// 故无条件把 -[DHFloatingController build] 置空——daemon 不需要悬浮窗;App 走 loader 注入不受影响。
+static void my_floating_build(id self, SEL _cmd) { (void)self; (void)_cmd; /* daemon 不建悬浮窗 */ }
+
+static void dh_disable_floating_window(void) {
+    static bool done = false;
+    if (done) return;
+    Class cls = NSClassFromString(@"DHFloatingController");
+    if (!cls) return;   // 类还没注册,等 dlopen 后那次兜底
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"build"));
+    if (!m) return;
+    method_setImplementation(m, (IMP)my_floating_build);
+    done = true;
+    syslog(LOG_NOTICE, TAG " 已禁用引擎悬浮窗(daemon 无 UIScene,-[DHFloatingController build] 置空)");
 }
 
 // 用 ellekit 的 MSHookFunction(本项目已依赖 ellekit)对引擎两个**导出 C 函数**做 inline hook,
@@ -237,6 +332,25 @@ static void *dh_control_thread(void *arg) {
     return NULL;
 }
 
+// 内存桥:等 collector 置 cmd_load(它读了 config 确认本 daemon 已开启),再 dlopen 引擎架桥。
+static void *dh_mem_load_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (g_dh_shm.cmd_load) {
+            g_dh_shm.dbg_enabled = 1;
+            syslog(LOG_NOTICE, TAG " 收到 collector cmd_load,dlopen 引擎架桥(内存桥)");
+            _dyld_register_func_for_add_image(dh_img_added);
+            void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
+            g_dh_shm.dbg_dlopen = h ? 1 : 0;
+            syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
+            if (h) { dh_install_health_hooks(); dh_swizzle_logstore(); dh_disable_floating_window(); }
+            return NULL;
+        }
+        usleep(200000);
+    }
+    return NULL;
+}
+
 __attribute__((constructor))
 static void dh_companion_init(void) {
     const char *prog = getprogname();
@@ -249,19 +363,31 @@ static void dh_companion_init(void) {
 
     syslog(LOG_NOTICE, TAG " 进驻 %s pid=%d", g_proc, getpid());
 
-    // 报活体(在线发现)
-    pthread_t th;
-    if (pthread_create(&th, NULL, dh_control_thread, NULL) == 0) pthread_detach(th);
+    // 自适应选桥:探测能否 connect-out 到 collector。通=socket 桥;被 sandbox 拒=内存桥
+    // (严格 daemon 如 securityd,靠 collector task_for_pid + vm_read/write 读写 g_dh_shm)。
+    int probe = dh_connect(DH_CONN_CONTROL);
+    if (probe >= 0) {
+        close(probe);
+        g_mem_bridge = false;
+        pthread_t th;   // socket 桥:常驻 control 报活体
+        if (pthread_create(&th, NULL, dh_control_thread, NULL) == 0) pthread_detach(th);
 
-    // 已开启 → 架桥载引擎
-    if (dh_enabled(g_proc)) {
-        syslog(LOG_NOTICE, TAG " %s 已启用,架桥载引擎", g_proc);
-        _dyld_register_func_for_add_image(dh_img_added);   // 引擎载入(构造函数前)触发重绑
-        void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
-        syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
-        // 引擎类已注册,把它的日志句柄改接 collector(daemon sandbox 写不了文件)。
-        // dh_img_added 时若符号/类还没就绪,这里兜底(hook 需在首次 _persist 前才能防标志,
-        // 正常应在 dh_img_added 那次已生效)。
-        if (h) { dh_install_health_hooks(); dh_swizzle_logstore(); }
+        // socket 桥:能读 config,自己判断是否已开启并架桥
+        if (dh_enabled(g_proc)) {
+            syslog(LOG_NOTICE, TAG " %s 已启用,架桥载引擎(socket 桥)", g_proc);
+            _dyld_register_func_for_add_image(dh_img_added);
+            void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
+            syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
+            if (h) { dh_install_health_hooks(); dh_swizzle_logstore(); dh_disable_floating_window(); }
+        }
+    } else {
+        // 内存桥:严格 daemon 读不了 jb config,不能自判是否开启;设 magic 后起线程等 collector 的
+        // cmd_load(collector 能读 config,代为通知),收到再 dlopen 引擎架桥。
+        g_mem_bridge = true;
+        g_dh_shm.magic = DH_SHM_MAGIC;
+        g_dh_shm.version = DH_SHM_VERSION;
+        syslog(LOG_NOTICE, TAG " connect collector 被拒,启用内存桥,等 collector 通知架桥");
+        pthread_t th;
+        if (pthread_create(&th, NULL, dh_mem_load_thread, NULL) == 0) pthread_detach(th);
     }
 }
