@@ -420,6 +420,60 @@ static void *mb_conn_thread(void *arg) {
 
 typedef struct { char proc[DH_PROC_MAX]; int pid; int lan_port; mach_port_t task; uint64_t shm; int lan_fd; } mb_target_t;
 
+// 内存桥日志落盘:严格 daemon 的引擎日志走不了 socket,companion 把日志字节写进 g_dh_shm.log_ring,
+// 本线程 vm_read 出来落盘 /var/log/dh-<proc>.log(与 socket 桥的 log_reader 同命名)。task 失效
+// (daemon 退出 / 桥被 teardown)即退出。单消费者:只有本线程读 log_ring 并前移 log_tail。
+static void *mb_log_thread(void *arg) {
+    mb_target_t *t = arg;
+    char safe[DH_PROC_MAX]; size_t j = 0;
+    for (size_t i = 0; t->proc[i] && j < sizeof(safe) - 1; i++) {
+        char ch = t->proc[i];
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-') safe[j++] = ch;
+    }
+    safe[j] = 0;
+    if (safe[0] == 0) return NULL;
+    char path[128]; snprintf(path, sizeof path, "/var/log/dh-%s.log", safe);
+    int out = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (out < 0) { logts("[collector] %s 内存桥日志打开失败 %s errno=%d", safe, path, errno); return NULL; }
+    logts("[collector] %s 内存桥日志落盘 -> %s", safe, path);
+    uint64_t base = t->shm;
+    uint32_t tail = 0;
+    mb_rd(t->task, base + offsetof(dh_shm_t, log_tail), &tail, 4);   // 续上次(通常 0)
+    uint8_t buf[8192];
+    for (;;) {
+        // 存活校验:daemon 退出 / 桥被 teardown 后,task 端口可能被复用 → mb_rd 会读到别的进程内存
+        // (垃圾)。校验 magic 仍在,失配即认为本 target 已失效并退出;否则会把垃圾当日志狂写(实测
+        // mobileactivationd 桥重建时旧线程读到垃圾 head → 104MB 垃圾文件)。
+        uint32_t mg = 0;
+        if (mb_rd(t->task, base + offsetof(dh_shm_t, magic), &mg, 4) != 0 || mg != DH_SHM_MAGIC) break;
+        uint32_t head = 0;
+        if (mb_rd(t->task, base + offsetof(dh_shm_t, log_head), &head, 4) != 0) break;   // task 失效
+        // 反同步钳制:ring 物理上最多 DH_LOG_RING_SZ 个未读字节;avail 超过必是读到垃圾或丢了数据,
+        // 跳到 head(丢弃这段),防狂写。
+        if ((uint32_t)(head - tail) > DH_LOG_RING_SZ) {
+            tail = head;
+            mb_wr(t->task, base + offsetof(dh_shm_t, log_tail), &tail, 4);
+        }
+        while ((int32_t)(head - tail) > 0) {
+            uint32_t avail = head - tail;
+            uint32_t k = avail < sizeof buf ? avail : (uint32_t)sizeof buf;
+            uint32_t pos = tail & (DH_LOG_RING_SZ - 1);
+            uint32_t first = (pos + k <= DH_LOG_RING_SZ) ? k : (DH_LOG_RING_SZ - pos);
+            if (mb_rd(t->task, base + offsetof(dh_shm_t, log_ring) + pos, buf, first) != 0) { close(out); return NULL; }
+            if (k > first && mb_rd(t->task, base + offsetof(dh_shm_t, log_ring), buf + first, k - first) != 0) { close(out); return NULL; }
+            ssize_t off = 0;
+            while (off < (ssize_t)k) { ssize_t w = write(out, buf + off, (size_t)(k - off)); if (w <= 0) break; off += w; }
+            tail += k;
+            mb_wr(t->task, base + offsetof(dh_shm_t, log_tail), &tail, 4);
+            if (mb_rd(t->task, base + offsetof(dh_shm_t, log_head), &head, 4) != 0) { close(out); return NULL; }
+        }
+        usleep(200000);   // 200ms 轮询
+    }
+    close(out);
+    return NULL;
+}
+
 static void *mb_lan_thread(void *arg) {
     mb_target_t *t = arg;
     logts("[collector] %s 内存桥反代于 *:%d(pid=%d shm=%#llx)", t->proc, t->lan_port, t->pid, (unsigned long long)t->shm);
@@ -545,6 +599,7 @@ static void *mem_bridge_manager(void *arg) {
                     if (bind(s, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(s, 16) == 0) {
                         t->lan_fd = s;
                         pthread_t th; if (pthread_create(&th, NULL, mb_lan_thread, t) == 0) pthread_detach(th);
+                        pthread_t lt; if (pthread_create(&lt, NULL, mb_log_thread, t) == 0) pthread_detach(lt);   // 引擎日志落盘
                         g_mb[g_mb_n++] = t;   // 登记(含 pid),供重启检测/销毁
                     } else { logts("[collector] %s 内存桥 bind :%d 失败 errno=%d", nm, t->lan_port, errno); close(s); free(t); }
                 }

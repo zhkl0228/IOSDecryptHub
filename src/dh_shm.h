@@ -25,6 +25,7 @@
 // 对齐 socket 桥的 POOL_MAX,留足余量。代价:companion 的静态 g_dh_shm ≈ 16×128KB=2MB BSS,
 // 对 daemon(设备 2.9GB)可忽略。改此值须 companion 与 collector 一起重建、daemon 重启换新桥。
 #define DH_MAX_CONN    16
+#define DH_LOG_RING_SZ (256u * 1024u) // 引擎日志聚合环大小,必须是 2 的幂
 
 // 连接状态:collector 与引擎经 vm_read/write 观察对方,靠这些标志推进。
 enum {
@@ -56,6 +57,14 @@ typedef struct {
                                      // (严格 daemon 读不了 jb config,由能读 config 的 collector 代为通知)
     volatile uint32_t _pad[2];
     dh_conn_t conn[DH_MAX_CONN];
+    // —— 引擎日志聚合(严格 daemon 内存桥)——
+    // 严格 daemon 沙盒封 socket,引擎日志走不了 collector 的 UNIX socket;改由 companion 把引擎
+    // _logFH 的字节写进这条单向环(log_head 生产),collector vm_read 后落盘 /var/log/dh-<proc>.log
+    // (log_tail 消费)。head/tail 单调递增(uint32 回绕),可用 = head - tail,环内偏移 = pos & (SZ-1)。
+    // 满时 companion 丢新字节(尽力聚合,不阻塞引擎日志)。
+    volatile uint32_t log_head;      // companion 生产位置(写入引擎日志字节)
+    volatile uint32_t log_tail;      // collector 消费位置(落盘后前移)
+    uint8_t log_ring[DH_LOG_RING_SZ];
 } dh_shm_t;
 
 #endif // DH_SHM_H

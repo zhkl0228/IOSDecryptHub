@@ -185,16 +185,57 @@ static int my_accept(int s, struct sockaddr *a, socklen_t *l) {
 // 不能 seek/truncate)。收字节的连接类型 = DH_CONN_LOG。
 static void (*orig_openLogHandleLocked)(id, SEL);
 
+// 内存桥日志 pump:引擎把日志写到 socketpair 一端,本线程从另一端读出,塞进 g_dh_shm.log_ring,
+// collector vm_read 落盘 /var/log/dh-<proc>.log。环满时丢弃剩余(尽力聚合,不阻塞引擎日志)。
+// (引擎写 _logFH 在其 reentrancy guard 内,不会被网络/文件 hook 捕获,故不会重现 socket 直连的
+//  100% CPU 正反馈。)
+static void *dh_log_pump(void *arg) {
+    int b = (int)(long)arg;
+    uint8_t buf[8192];
+    for (;;) {
+        ssize_t n = read(b, buf, sizeof buf);
+        if (n <= 0) break;   // 引擎关了日志句柄(dealloc)
+        uint32_t off = 0;
+        while (off < (uint32_t)n) {
+            uint32_t space = DH_LOG_RING_SZ - (g_dh_shm.log_head - g_dh_shm.log_tail);
+            if (space == 0) break;   // 环满 → 丢弃这批剩余字节
+            uint32_t k = ((uint32_t)n - off) < space ? ((uint32_t)n - off) : space;
+            uint32_t pos = g_dh_shm.log_head & (DH_LOG_RING_SZ - 1);
+            uint32_t first = (pos + k <= DH_LOG_RING_SZ) ? k : (DH_LOG_RING_SZ - pos);
+            memcpy(&g_dh_shm.log_ring[pos], buf + off, first);
+            if (k > first) memcpy(&g_dh_shm.log_ring[0], buf + off + first, k - first);
+            g_dh_shm.log_head += k; off += k;
+        }
+    }
+    close(b);
+    return NULL;
+}
+
 static void my_openLogHandleLocked(id self, SEL _cmd) {
     Ivar iv = class_getInstanceVariable([self class], "_logFH");
     if (!iv) { if (orig_openLogHandleLocked) orig_openLogHandleLocked(self, _cmd); return; }
     if (object_getIvar(self, iv)) return;   // 已有句柄
-    int fd = dh_connect(DH_CONN_LOG);
-    if (fd < 0) return;                      // collector 没在,下次 _persist 再试
-    // closeOnDealloc:YES —— 引擎 dealloc 时连带关掉 socket,不泄漏。
+    int fd;
+    if (g_mem_bridge) {
+        // 严格 daemon:sandbox 封 socket,不能像普通 daemon 那样 dh_connect 到 collector(必 EPERM,
+        // /var/log 从来没有 dh-securityd/lockdownd.log 就是证据)。改走内存桥:给引擎一端 socketpair,
+        // pump 线程把另一端字节搬进 g_dh_shm.log_ring,collector vm_read 落盘。
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return;
+        pthread_t th;
+        if (pthread_create(&th, NULL, dh_log_pump, (void *)(long)sv[1]) != 0) { close(sv[0]); close(sv[1]); return; }
+        pthread_detach(th);
+        fd = sv[0];
+        syslog(LOG_NOTICE, TAG " 引擎日志改接内存桥 log ring(fd=%d)", fd);
+    } else {
+        // socket 桥(普通 daemon):连 collector,由它落盘 /var/log/dh-<proc>.log。
+        fd = dh_connect(DH_CONN_LOG);
+        if (fd < 0) return;                  // collector 没在,下次 _persist 再试
+        syslog(LOG_NOTICE, TAG " 引擎日志句柄改接 collector(fd=%d)", fd);
+    }
+    // closeOnDealloc:YES —— 引擎 dealloc 时连带关掉 fd(socket/socketpair 一端),不泄漏。
     NSFileHandle *fh = [[NSFileHandle alloc] initWithFileDescriptor:fd closeOnDealloc:YES];
     object_setIvar(self, iv, fh);            // 非 ARC:alloc 的所有权转移给 ivar
-    syslog(LOG_NOTICE, TAG " 引擎日志句柄改接 collector(fd=%d)", fd);
 }
 
 static void my_rotateLocked(id self, SEL _cmd) { (void)self; (void)_cmd; /* socket 不可 rotate */ }
