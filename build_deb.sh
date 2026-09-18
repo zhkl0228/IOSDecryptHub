@@ -72,7 +72,6 @@ APP_NAME="IOSDecryptHubManager"
 DAEMON_BIN="IOSDecryptHubUpdated"
 # 系统 daemon 注入(M1):companion 注入进白名单 daemon,collector 反代出 LAN 端口
 COMPANION_SRC="$SCRIPT_DIR/src/companion.m"
-FISHHOOK_SRC="$SCRIPT_DIR/src/fishhook.c"
 COLLECTOR_SRC="$SCRIPT_DIR/daemon/collector.c"
 DAEMONS_HDR="$SCRIPT_DIR/src/dh_daemons.h"
 COMPANION_DYLIB="DHCompanion.dylib"
@@ -141,13 +140,14 @@ compile_companion() {
     done
     info "编译 companion (archs=$ARCHS)..."
     mkdir -p "$(dirname "$OUT")"
-    # companion 非 ARC(constructor + 手动 socket);fishhook.c 一起编,PAC 写入见其 ptrauth 补丁。
+    # companion 非 ARC(constructor + 手动 socket);socket/日志 hook 用 ellekit MSHookFunction(inline),
+    # 运行时按需 dlopen libsubstrate/libellekit,故编译期不额外链库。
     $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
         -dynamiclib -install_name /usr/lib/IOSDecryptHub/$COMPANION_DYLIB \
         -ObjC -Wall -O2 \
         -I"$SCRIPT_DIR/src" \
         -framework Foundation \
-        "$COMPANION_SRC" "$FISHHOOK_SRC" -o "$OUT"
+        "$COMPANION_SRC" -o "$OUT"
 }
 
 compile_collector() {

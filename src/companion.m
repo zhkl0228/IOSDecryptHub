@@ -2,13 +2,15 @@
 //
 // 职责(两段式):
 //   1) 常驻:向 collector(root)注册报活体(在线发现),不载引擎、开销极小;
-//   2) 若该 daemon 在 enabledExecutables 名单里:用 PAC-correct fishhook 把引擎 WebUI 的
-//      bind/listen/accept 重定向成 connect-out 到 collector(逃出 sandbox 的 inbound-bind 禁令),
-//      再 dlopen 引擎。collector 把这些数据连接反代成一个 LAN 端口。
+//   2) 若该 daemon 在 enabledExecutables 名单里:用 ellekit MSHookFunction 对 libSystem 的
+//      bind/listen/accept 做 inline hook,把引擎 WebUI 的 socket I/O 重定向(普通 daemon:connect-out
+//      到 collector;严格 daemon:走内存桥),再 dlopen 引擎。collector 反代成一个 LAN 端口。
 //
-// 关键(M0 实测):dyld __interpose 对「后 dlopen 的引擎」不生效,必须 fishhook;且只能
-// 对引擎镜像重绑(全局会改坏 host daemon 自己的 socket)。fishhook 写入按 arm64e auth_got
-// 模式 PAC 签名(见 fishhook.c 的 ptrauth 补丁)。
+// 关键:hook 早在引擎镜像载入(构造函数前)就装,赶在引擎 bind 之前;guard 保证只对引擎的 WebUI
+// socket(bind 端口 8088-8108、listen/accept 的 g_engine_fd)动手,daemon 自身及其它 socket 全透传。
+// 曾用 fishhook 只重绑引擎镜像 GOT,但实测 1.27.x 引擎在 **lockdownd** 里调 accept 会**绕过**那个
+// GOT 槽(bind/listen 不绕、mobileactivationd 不绕)→ 引擎不 serve;改用 inline hook 拦真实函数本体,
+// 不管调用方走不走 GOT 都命中,对所有 daemon 稳(见 dh_install_socket_hooks)。
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
@@ -24,7 +26,6 @@
 #import <poll.h>
 #import <mach-o/dyld.h>
 #import <objc/runtime.h>
-#import "fishhook.h"
 #import "dh_bridge.h"
 #import "dh_daemons.h"
 #import "dh_shared.h"   // DH_KEY_EXECS(与 manager 共享的名单 key)
@@ -292,6 +293,41 @@ static long my_dh_diag_append(int board, const char *level, const char *msg) {
     return orig_dh_diag_append ? orig_dh_diag_append(board, level, msg) : 0;
 }
 
+// 取 ellekit 的 MSHookFunction(substrate 兼容符号在 libellekit,libsubstrate 软链到它)。
+static void *dh_get_mshook(void) {
+    void *ms = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (!ms) {
+        void *h = dlopen("/var/jb/usr/lib/libsubstrate.dylib", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen("/var/jb/usr/lib/libellekit.dylib", RTLD_LAZY | RTLD_GLOBAL);
+        if (h) ms = dlsym(h, "MSHookFunction");
+    }
+    return ms;
+}
+
+// 用 MSHookFunction 对 libSystem 的 bind/listen/accept 做 inline hook(拦真实函数本体)。
+// 为何不用 fishhook 只重绑引擎镜像的 GOT:实测 1.27.x 引擎在 **lockdownd** 里调 accept 会**绕过**
+// 引擎镜像的 GOT 槽(bind/listen 没绕、mobileactivationd 也没绕),fishhook 拦不到 → 引擎在 faked fd
+// 上空转 real accept、不 serve。inline hook 拦的是真实函数本体,不管调用方走不走那个 GOT 都命中,
+// 对所有 daemon 都稳。guard(bind 认端口 8088-8108、listen/accept 认 g_engine_fd)保证只对引擎的
+// WebUI socket 动手,daemon 自身及其它 socket 全部透传。早期(dh_img_added,构造函数前)装,赶在
+// 引擎 bind 之前。real_bind/real_listen/real_accept 由 MSHookFunction 设为调用原函数的 trampoline。
+static void dh_install_socket_hooks(void) {
+    static bool done = false;
+    if (done) return;
+    void (*MSHookFunction)(void *, void *, void **) =
+        (void (*)(void *, void *, void **))dh_get_mshook();
+    if (!MSHookFunction) return;   // ellekit 还没就绪,留给下次兜底
+    void *b = dlsym(RTLD_DEFAULT, "bind");
+    void *l = dlsym(RTLD_DEFAULT, "listen");
+    void *ac = dlsym(RTLD_DEFAULT, "accept");
+    if (!b || !l || !ac) return;
+    MSHookFunction(b,  (void *)my_bind,   (void **)&real_bind);
+    MSHookFunction(l,  (void *)my_listen, (void **)&real_listen);
+    MSHookFunction(ac, (void *)my_accept, (void **)&real_accept);
+    done = true;
+    syslog(LOG_NOTICE, TAG " 已 inline-hook bind/listen/accept(引擎 WebUI socket 重定向)");
+}
+
 static void dh_install_health_hooks(void) {
     static bool done = false;
     if (done) return;
@@ -299,13 +335,7 @@ static void dh_install_health_hooks(void) {
     void *da = dlsym(RTLD_DEFAULT, "dh_diag_append");
     if (!pf || !da) return;   // 符号未解析到,留给下次兜底
     void (*MSHookFunction)(void *, void *, void **) =
-        (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!MSHookFunction) {
-        // ellekit 的 substrate 兼容符号在 libellekit(libsubstrate 软链到它),按需 dlopen 引入。
-        void *h = dlopen("/var/jb/usr/lib/libsubstrate.dylib", RTLD_LAZY | RTLD_GLOBAL);
-        if (!h) h = dlopen("/var/jb/usr/lib/libellekit.dylib", RTLD_LAZY | RTLD_GLOBAL);
-        if (h) MSHookFunction = (void (*)(void *, void *, void **))dlsym(h, "MSHookFunction");
-    }
+        (void (*)(void *, void *, void **))dh_get_mshook();
     if (!MSHookFunction) { syslog(LOG_NOTICE, TAG " 无 MSHookFunction,health hook 未装"); return; }
     MSHookFunction(pf, (void *)my_health_persist_fail, NULL);
     MSHookFunction(da, (void *)my_dh_diag_append, (void **)&orig_dh_diag_append);
@@ -313,21 +343,18 @@ static void dh_install_health_hooks(void) {
     syslog(LOG_NOTICE, TAG " 已 inline-hook dh_health_persist_fail + dh_diag_append(滤落盘失败)");
 }
 
-// 引擎镜像载入(构造函数之前)时,只对它重绑 bind/listen/accept。
+// 引擎镜像载入(构造函数之前)时触发:装 socket inline hook(赶在引擎 bind 前)、health hook、
+// 日志句柄 swizzle。socket hook 改用 inline(见 dh_install_socket_hooks:fishhook GOT 在 lockdownd
+// 会被引擎的 accept 调用绕过)。
 static void dh_img_added(const struct mach_header *mh, intptr_t slide) {
+    (void)slide;
     Dl_info info;
     if (dladdr(mh, &info) == 0 || !info.dli_fname) return;
     if (!strstr(info.dli_fname, "decrypt_helper")) return;
-    struct rebinding r[] = {
-        { "bind",   (void *)my_bind,   (void **)&real_bind },
-        { "listen", (void *)my_listen, (void **)&real_listen },
-        { "accept", (void *)my_accept, (void **)&real_accept },
-    };
-    rebind_symbols_image((void *)mh, slide, r, 3);
-    // 构造函数前:inline-hook 落盘失败上报(首次也静默),并尝试 swizzle 日志句柄(类若已注册)。
+    dh_install_socket_hooks();
     dh_install_health_hooks();
     dh_swizzle_logstore();
-    syslog(LOG_NOTICE, TAG " 已重绑引擎 socket + 日志改接 collector");
+    syslog(LOG_NOTICE, TAG " 已装 socket/日志 hook(引擎镜像载入)");
 }
 
 // —— 自检 ——
