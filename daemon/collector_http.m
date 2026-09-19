@@ -38,7 +38,7 @@ static NSString *procState(NSString *proc, int *lanPort) {
 }
 
 #define AGG_PORT 8089
-#define ENGINE_VER "1.27.3"   // 重建 stats 显示用(当前 vendor 引擎版本;仅展示)
+#define ENGINE_VER "1.27.4"   // 重建 stats 显示用(当前 vendor 引擎版本;仅展示)
 
 static void aggLog(NSString *s) { dh_log([s UTF8String]); }
 
