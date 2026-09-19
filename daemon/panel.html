@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IOSDecryptHub 控制台</title>
+<style>
+:root{--bg:#0b0d12;--card:#12151d;--line:#232838;--fg:#e6e8ee;--dim:#8b93a7;--on:#5fd08a;--idle:#d8b24a;--off:#6b7385;--ac:#7fd6df}
+*{box-sizing:border-box}
+body{font:15px/1.5 -apple-system,BlinkMacSystemFont,Inter,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:22px}
+h1{font-size:19px;margin:0 0 4px}
+.sub{color:var(--dim);font-size:13px;margin-bottom:16px}
+.tabs{display:flex;gap:8px;margin-bottom:18px}
+.tab{padding:8px 18px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--dim);cursor:pointer;user-select:none}
+.tab.sel{color:var(--fg);border-color:var(--ac);background:#161c28}
+table{border-collapse:collapse;width:100%;max-width:1040px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--dim);font-weight:600;font-size:12.5px;letter-spacing:.02em}
+a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
+.on{color:var(--on)}.idle{color:var(--idle)}.off{color:var(--off)}
+.n{color:#c8cede;font-variant-numeric:tabular-nums}
+.muted{color:var(--dim);font-size:12.5px}
+.tag{font-size:11px;padding:1px 6px;border-radius:6px;background:#1b2230;color:var(--dim);vertical-align:middle}
+.sw{position:relative;display:inline-block;width:42px;height:23px;flex:none}
+.sw input{opacity:0;width:0;height:0}
+.sl{position:absolute;inset:0;background:#2a3040;border-radius:23px;transition:.15s;cursor:pointer}
+.sl:before{content:"";position:absolute;height:17px;width:17px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
+.sw input:checked+.sl{background:var(--on)}
+.sw input:checked+.sl:before{transform:translateX(19px)}
+.btn{display:inline-block;padding:5px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer;font-size:13px;line-height:1.4}
+.btn:hover{border-color:var(--ac)}.btn:active{opacity:.55}
+.txt{padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#0b0d12;color:var(--fg);width:300px;max-width:60vw}
+.row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#1b2230;border:1px solid var(--line);padding:10px 18px;border-radius:10px;opacity:0;transition:.2s;pointer-events:none;max-width:80vw}
+#toast.show{opacity:1}
+.err{color:#e6788a}
+</style></head><body>
+<h1>IOSDecryptHub · 控制台</h1>
+<div class="sub">开关引擎注入、重启进程;历史捕获点进程名查看。</div>
+<div class="tabs">
+  <div class="tab sel" data-t="app" onclick="seltab(this)">App</div>
+  <div class="tab" data-t="daemon" onclick="seltab(this)">系统 daemon</div>
+</div>
+<div id="app"></div>
+<div id="daemon" style="display:none"></div>
+<div id="toast"></div>
+
+<script>
+var H = location.hostname;
+function esc(s){return (s==null?"":""+s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+function toast(m,isErr){var t=document.getElementById("toast");t.innerHTML=isErr?'<span class="err">'+esc(m)+'</span>':esc(m);t.className="show";setTimeout(function(){t.className="";},2200);}
+function seltab(el){
+  document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("sel");});
+  el.classList.add("sel");
+  document.getElementById("daemon").style.display = el.dataset.t=="daemon" ? "" : "none";
+  document.getElementById("app").style.display    = el.dataset.t=="app"    ? "" : "none";
+  if(el.dataset.t=="daemon") loadD(); else loadA();
+}
+function curTab(){return document.querySelector(".tab.sel").dataset.t;}
+async function post(u){try{var r=await fetch(u,{method:"POST"});return await r.json();}catch(e){return {ok:false,err:"网络错误"};}}
+function pidCell(pid){return pid>0 ? '<span class="n">'+pid+'</span>' : '<span class="off">—</span>';}
+
+/* ---- 系统 daemon ---- */
+async function loadD(){
+  var a;
+  try{ a = await (await fetch("/api/control/list?kind=daemon")).json(); }catch(e){ return; }
+  var h = '<table><tr><th>进程</th><th>PID</th><th>注入</th><th>状态</th><th>引擎</th><th>捕获</th><th>操作</th></tr>';
+  a.forEach(function(d){
+    var sc = d.state=="live"?"on":(d.state=="idle"?"idle":"off");
+    var sl = d.state=="live"?"引擎就绪":(d.state=="idle"?"进程在·未注入":"已退出");
+    var ev = d.state!="live" ? '<span class="off">—</span>'
+           : (!d.version ? '<span class="off">?</span>'
+           : (d.latest ? esc(d.version) : '<span class="idle">'+esc(d.version)+' · 旧</span>'));
+    var live = d.state=="live";
+    h += '<tr><td><a href="/d/'+encodeURIComponent(d.proc)+'/">'+esc(d.proc)+'</a>'
+       +  '<div class="muted">'+esc(d.disp)+'</div></td>'
+       +  '<td>'+pidCell(d.pid)+'</td>'
+       +  '<td><label class="sw"><input type="checkbox" '+(d.enabled?"checked":"")
+       +      ' onchange="tog(\''+d.proc+'\',this.checked)"><span class="sl"></span></label></td>'
+       +  '<td class="'+sc+'">'+sl+'</td><td>'+ev+'</td><td class="n">'+d.count+'</td>'
+       +  '<td><div class="row-actions"><button class="btn" onclick="rst(\''+d.proc+'\')">重启</button>'
+       +      (live?'<a class="btn" href="http://'+H+':'+d.port+'/" target="_blank">连活引擎 :'+d.port+'</a>':'')
+       +  '</div></td></tr>';
+  });
+  h += '</table><div class="muted" style="margin-top:10px">开启注入后:内存桥 daemon 下轮(~5s)自动架桥;普通(socket 桥)daemon 需<b>重启</b>才生效。on-demand daemon 重启后若无调用会显示「已退出」,下次被系统用到时自动带新引擎。</div>';
+  document.getElementById("daemon").innerHTML = h;
+}
+async function tog(p,on){
+  var r = await post("/api/control/enable?kind=daemon&proc="+encodeURIComponent(p)+"&on="+(on?1:0));
+  if(r.ok) toast(on?("已启用 "+p+"(socket 桥需重启生效)"):("已停用 "+p));
+  else toast("操作失败:"+(r.err||""),true);
+  loadD();
+}
+async function rst(p){
+  toast("重启 "+p+" …");
+  var r = await post("/api/control/restart?proc="+encodeURIComponent(p));
+  toast(r.ok ? (p+" 已重启(引擎架桥需几秒)") : (p+" 重启失败"), !r.ok);
+  [2500,6000,10000].forEach(function(t){ setTimeout(function(){ if(curTab()=="daemon") loadD(); }, t); });  // 架桥有延迟,多刷几次
+}
+
+/* ---- App ---- */
+var _apps = [];
+async function loadA(){
+  var a;
+  try{ a = await (await fetch("/api/control/list?kind=app")).json(); }catch(e){ return; }
+  _apps = a.apps || [];
+  if(!document.getElementById("af")){
+    document.getElementById("app").innerHTML =
+        '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span></div>'
+      + '<div id="atbl"></div>'
+      + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
+      + '(App 引擎 WebUI 只在 App 前台时活、后台被 iOS 挂起,故不做「连活引擎」,从引擎悬浮窗看 ip:port 访问。)</div>';
+  }
+  renderA();
+}
+function renderA(){
+  var f = document.getElementById("af");
+  var kw = (f ? f.value : "").trim().toLowerCase();
+  var list = _apps.filter(function(x){ return !kw || (x.name+" "+x.bundle).toLowerCase().indexOf(kw)>=0; });
+  document.getElementById("acnt").textContent = list.length+" 个";
+  var h = '<table><tr><th>App</th><th>PID</th><th>注入</th><th>运行</th><th>操作</th></tr>';
+  list.forEach(function(x){
+    h += '<tr><td>'+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
+      +  '<div class="muted">'+esc(x.bundle)+'</div></td>'
+      +  '<td>'+pidCell(x.pid)+'</td>'
+      +  '<td><label class="sw"><input type="checkbox" '+(x.enabled?"checked":"")
+      +      ' onchange="togA(\''+esc(x.bundle)+'\',this.checked)"><span class="sl"></span></label></td>'
+      +  '<td>'+(x.running?'<span class="on">运行中</span>':'<span class="off">未运行</span>')+'</td>'
+      +  '<td>'+(x.running?'<button class="btn" onclick="rstA(\''+esc(x.bundle)+'\')">重启</button>':'<span class="muted">—</span>')+'</td></tr>';
+  });
+  if(!list.length) h += '<tr><td class="muted" colspan="5">无匹配</td></tr>';
+  h += '</table>';
+  document.getElementById("atbl").innerHTML = h;
+}
+async function togA(b,on){
+  var r = await post("/api/control/enable?kind=app&bundle="+encodeURIComponent(b)+"&on="+(on?1:0));
+  if(r.ok){ var x=_apps.find(function(y){return y.bundle==b;}); if(x)x.enabled=on; toast(on?("已启用 "+b+"(重启 App 生效)"):("已停用 "+b)); }
+  else toast("失败:"+(r.err||""), true);
+}
+async function rstA(b){
+  toast("结束 "+b+" …");
+  var r = await post("/api/control/restart-app?bundle="+encodeURIComponent(b));
+  toast(r.ok ? (b+" 已结束进程,重新打开即注入") : (r.note||"未在运行"), !r.ok);
+  setTimeout(loadA, 1500);
+}
+
+loadA();
+setInterval(function(){ if(curTab()=="daemon") loadD(); else loadA(); }, 5000);
+</script>
+</body></html>

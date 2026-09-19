@@ -25,10 +25,38 @@
 #import <errno.h>
 #import <sys/sysctl.h>
 #import <mach-o/dyld.h>   // _NSGetExecutablePath
+#import <signal.h>        // kill(App 重启=结束进程)
 
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
 extern int  dh_bridge_online(const char *proc, int *lan_port);  // collector.c:引擎是否就绪(可连活引擎)
 extern int  dh_proc_alive(const char *proc);                    // collector.c:进程是否存活(sysctl),0=已退出
+extern int  dh_restart_daemon(const char *proc);                // collector.c:kickstart 重启 daemon,0=成功
+extern const char *dh_daemons_json(void);                       // collector.c:白名单 [{proc,disp,domain}]
+
+// 注入门控 config(companion dh_enabled / collector mb_is_enabled 都读这份;与它们同路径)。
+#define DH_CFG_PATH @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
+#define DH_KEY_EXECS   @"enabledExecutables"   // 系统 daemon 注入名单(按 exec 名)
+#define DH_KEY_BUNDLES @"enabledBundles"        // App 注入名单(按 bundle id)
+static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
+// 门控 config 读:key 下的数组是否含 val。key = DH_KEY_EXECS(daemon)/ DH_KEY_BUNDLES(App)。
+static BOOL cfgHasMember(NSString *key, NSString *val) {
+    NSArray *a = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
+    return [a isKindOfClass:[NSArray class]] && [a containsObject:val];
+}
+static NSArray *cfgMembers(NSString *key) {
+    NSArray *a = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
+    return [a isKindOfClass:[NSArray class]] ? a : @[];
+}
+// 读改写:保留其它 key 与同 key 里其它成员,只加/删本 val(整份覆写会互抹 enabledBundles/Executables,见 memory)。
+static BOOL cfgSetMember(NSString *key, NSString *val, BOOL on) {
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSMutableArray *a = [([d[key] isKindOfClass:[NSArray class]] ? d[key] : @[]) mutableCopy];
+    BOOL has = [a containsObject:val];
+    if (on && !has) [a addObject:val];
+    else if (!on && has) [a removeObject:val];
+    d[key] = a;
+    return [d writeToFile:DH_CFG_PATH atomically:YES];
+}
 
 // daemon 三态:live=引擎就绪可连活引擎 / idle=进程在但没注入引擎(未启用) / dead=进程已退出仅历史。
 // 返回并回填 lan_port(仅 live 有意义)。
@@ -301,43 +329,238 @@ static BOOL validProc(NSString *p) {
         @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"];
     return [[p stringByTrimmingCharactersInSet:ok] length] == 0;
 }
-static NSString *indexHTML(void) {
-    NSMutableString *h = [NSMutableString string];
-    [h appendString:@"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>IOSDecryptHub 聚合</title><style>"
-        "body{font:15px/1.5 -apple-system,Inter,sans-serif;background:#0b0d12;color:#e6e8ee;margin:0;padding:24px}"
-        "h1{font-size:20px;margin:0 0 16px}table{border-collapse:collapse;width:100%;max-width:900px}"
-        "th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #232838}th{color:#8b93a7;font-weight:600}"
-        "a{color:#7fd6df;text-decoration:none}a:hover{text-decoration:underline}"
-        ".on{color:#5fd08a}.idle{color:#d8b24a}.off{color:#8b93a7}.n{color:#c8cede;font-variant-numeric:tabular-nums}"
-        "</style><h1>IOSDecryptHub · daemon 捕获聚合</h1>"];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/log" error:nil];
-    NSMutableArray *procs = [NSMutableArray array];
-    for (NSString *f in files)
-        if ([f hasPrefix:@"dh-"] && [f hasSuffix:@".cap.jsonl"])
-            [procs addObject:[f substringWithRange:NSMakeRange(3, f.length - 3 - 10)]];   // 去 "dh-" 与 ".cap.jsonl"
-    [procs sortUsingSelector:@selector(compare:)];
-    if (!procs.count) { [h appendString:@"<p class=off>暂无捕获记录(还没有 daemon 产生 cap.jsonl)。</p>"]; return h; }
-    [h appendString:@"<table><tr><th>进程</th><th>状态</th><th>捕获数</th><th>最近</th><th></th></tr>"];
-    for (NSString *proc in procs) {
-        if (!validProc(proc)) continue;
-        NSArray *entries = loadEntries(proc);
-        int lanPort = 0; NSString *state = procState(proc, &lanPort);   // live / idle / dead
-        BOOL live = [state isEqualToString:@"live"];
-        NSString *cls = live ? @"on" : ([state isEqualToString:@"idle"] ? @"idle" : @"off");
-        NSString *label = live ? @"引擎就绪" : ([state isEqualToString:@"idle"] ? @"进程在·未注入" : @"已退出");
-        long long lastMs = entries.count ? jint([entries lastObject][@"tsMs"]) : 0;
-        [h appendFormat:@"<tr><td><a href='/d/%@/'>%@</a></td>"
-            "<td class='%@'>%@</td><td class=n>%lu</td><td class=n>%@</td><td>%@</td></tr>",
-            proc, proc, cls, label,
-            (unsigned long)entries.count,
-            lastMs ? fmtTs(lastMs) : @"—",
-            live ? [NSString stringWithFormat:@"<a class=live href='#' data-port='%d'>连活引擎</a>", lanPort] : @""];
+// 同步 GET 本机 http://127.0.0.1:<port>/api/stats → dict(在页面生成线程里,超时兜底)。连的是 collector
+// 自己的 daemon 反代端口 / 或 App 进程自 bind 的引擎端口,只读请求不刷引擎网络 tab。
+static NSDictionary *fetchStats(int port, double timeout) {
+    if (port <= 0) return nil;
+    NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/api/stats", port]]
+                                         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:timeout];
+    __block NSDictionary *res = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+        if ([j isKindOfClass:[NSDictionary class]]) res = j;
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 0.5) * NSEC_PER_SEC)));
+    return res;
+}
+// live daemon 的引擎版本——区分「旧实例没重启=还跑旧引擎」。
+static NSString *liveEngineVersion(int port) {
+    NSString *v = fetchStats(port, 2.0)[@"version"];
+    return [v isKindOfClass:[NSString class]] ? [v stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : nil;
+}
+// (曾试过扫 8088-8108 按 bundleId 发现 App 引擎端口做「连活引擎」,但 iOS 会挂起后台第三方 App、其端口
+//  不响应,扫不到——App 引擎 WebUI 只在 App 前台时活,稳定的连活引擎只有常驻不挂起的 daemon 能做。故 App
+//  tab 不做连活引擎,只列表/注入/pid/运行/重启。见 memory「App 后台挂起端口扫不到」坑。)
+// 引擎版本按「实例(pid)」缓存:同一 pid 只查一次活引擎(≈引擎加载后首见时),索引页刷新直接读缓存、不再
+// 每次拉;daemon 重启(pid 变)自动重查。为什么不让 companion 加载引擎时自报:要看的「还跑旧引擎」的
+// daemon 跑的是**旧 companion**(与旧引擎同批部署,没有自报代码),自报不了 → 只能 collector 侧查,缓存兜住效率。
+static NSString *cachedEngineVersion(NSString *proc, int pid, int port) {
+    static NSMutableDictionary *cache; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    @synchronized(cache) {
+        NSArray *e = cache[proc];   // @[pid, ver(NSString 或 NSNull), 负缓存到期]
+        if (e && [e[0] intValue] == pid) {
+            if ([e[1] isKindOfClass:[NSString class]]) return e[1];   // 有版本:同 pid 一直用
+            if ([e[2] doubleValue] > now) return nil;                 // 负缓存未过期:仍 nil
+            // 负缓存过期 → 落下去重查(修:重启后引擎架桥要 1~2s,那时查 nil 不能永久卡住)
+        }
     }
-    // 活引擎在各自 LAN 端口,链接的 host 服务端不知道 → 用浏览器 location.hostname 补全。
-    [h appendString:@"</table><script>document.querySelectorAll('a.live').forEach(function(a){"
-        "a.href='http://'+location.hostname+':'+a.dataset.port+'/';a.textContent='连活引擎 :'+a.dataset.port;});</script>"];
-    return h;
+    NSString *ver = liveEngineVersion(port);
+    @synchronized(cache) { cache[proc] = @[@(pid), ver ?: (id)[NSNull null], @(now + (ver ? 3600 : 5))]; }
+    return ver;
+}
+// —— 控制台数据/操作 ——
+static id whitelistArray(void) {
+    return [NSJSONSerialization JSONObjectWithData:[@(dh_daemons_json()) dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+}
+static BOOL isWhitelisted(NSString *proc) {
+    id wl = whitelistArray();
+    if (![wl isKindOfClass:[NSArray class]]) return NO;
+    for (NSDictionary *w in wl) if ([w[@"proc"] isEqual:proc]) return YES;
+    return NO;
+}
+// 捕获数:只数 '\n' 不解析(轻量,控制台刷新用),不去重(粗略指示)。
+static NSUInteger capLineCount(NSString *proc) {
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:capPath(proc)];
+    if (!fh) return 0;
+    NSUInteger n = 0; NSData *c;
+    while ((c = [fh readDataOfLength:(1u << 16)]).length)
+        { const uint8_t *b = c.bytes; for (NSUInteger i = 0; i < c.length; i++) if (b[i] == '\n') n++; }
+    return n;
+}
+// 控制台 daemon 列表:白名单 × {enabled(config), state(live/idle/dead), version, latest, count, port}。
+static NSArray *controlDaemonList(void) {
+    id wl = whitelistArray();
+    NSMutableArray *out = [NSMutableArray array];
+    if (![wl isKindOfClass:[NSArray class]]) return out;
+    for (NSDictionary *w in wl) {
+        NSString *proc = w[@"proc"];
+        if (![proc isKindOfClass:[NSString class]]) continue;
+        int lanPort = 0; NSString *state = procState(proc, &lanPort);
+        BOOL live = [state isEqualToString:@"live"];
+        int pid = dh_proc_alive([proc UTF8String]);
+        NSString *ver = live ? cachedEngineVersion(proc, pid, lanPort) : nil;
+        [out addObject:@{
+            @"proc": proc, @"disp": (w[@"disp"] ?: proc), @"domain": (w[@"domain"] ?: @""),
+            @"enabled": @(cfgHasMember(DH_KEY_EXECS, proc)),
+            @"state": state, @"version": (ver ?: @""), @"pid": @(pid),
+            @"latest": @(ver != nil && [ver isEqualToString:@ENGINE_VER]),
+            @"count": @(capLineCount(proc)), @"port": @(live ? lanPort : 0),
+        }];
+    }
+    return out;
+}
+// —— App 桌面可见性过滤(照抄 manager DHAppEnumerator,滤掉非桌面系统组件)——
+static BOOL appTagsNonHome(id tags) {
+    if (![tags isKindOfClass:[NSArray class]]) return NO;
+    for (id t in (NSArray *)tags) {
+        if (![t isKindOfClass:[NSString class]]) continue;
+        if ([t caseInsensitiveCompare:@"hidden"] == NSOrderedSame) return YES;
+        if ([t caseInsensitiveCompare:@"SBInternalAppTag"] == NSOrderedSame) return YES;
+    }
+    return NO;
+}
+static BOOL appHasIcon(NSDictionary *info) {
+    id icons = info[@"CFBundleIcons"];
+    id primary = [icons isKindOfClass:[NSDictionary class]] ? icons[@"CFBundlePrimaryIcon"] : nil;
+    id files = [primary isKindOfClass:[NSDictionary class]] ? primary[@"CFBundleIconFiles"] : nil;
+    if ([files isKindOfClass:[NSArray class]] && [files count]) return YES;
+    id legacy = info[@"CFBundleIconFiles"];
+    if ([legacy isKindOfClass:[NSArray class]] && [legacy count]) return YES;
+    id single = info[@"CFBundleIconFile"];
+    return [single isKindOfClass:[NSString class]] && [single length] > 0;
+}
+static BOOL appHomeDeny(NSString *bid) {
+    static NSSet *deny; static dispatch_once_t o;
+    dispatch_once(&o, ^{ deny = [NSSet setWithArray:@[@"com.apple.sidecar",@"com.apple.webapp",@"com.apple.previewshell",
+        @"com.apple.appleseed.feedbackassistant",@"com.apple.animoji.stickersapp",@"com.apple.news",@"com.apple.smsfilter",
+        @"com.apsqa.metistest"]]; });
+    return [deny containsObject:bid.lowercaseString];
+}
+
+// 扫目录枚举 App(桌面可见的):系统/越狱在 /Applications、/var/jb/Applications;用户在 /var/containers/Bundle/Application/*。
+// 系统 App 只留「有图标 + SBAppTags 非隐藏 + 非 denylist」(滤掉一堆非桌面系统组件);用户 App 全留;已启用的
+// 一律留(即使被过滤)。springboard 绝不列(注入会 respring 循环)。读 Info.plist,缓存 30s。
+static NSArray *enumApps(void) {
+    static NSArray *cache; static NSTimeInterval cacheT; static NSLock *lock; static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    [lock lock];
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (cache && now - cacheT < 30) { NSArray *c = cache; [lock unlock]; return c; }
+    [lock unlock];
+    NSMutableDictionary *apps = [NSMutableDictionary dictionary];
+    NSSet *en = [NSSet setWithArray:cfgMembers(DH_KEY_BUNDLES)];   // 已启用的一律留(即使被过滤)
+    NSFileManager *fm = [NSFileManager defaultManager];
+    void (^scan)(NSString *) = ^(NSString *dir) {
+        for (NSString *e in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if (![[e.pathExtension lowercaseString] isEqualToString:@"app"]) continue;
+            NSString *ap = [dir stringByAppendingPathComponent:e];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[ap stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bid = info[@"CFBundleIdentifier"];
+            if (![bid isKindOfClass:[NSString class]] || !bid.length || apps[bid]) continue;
+            NSString *lbid = bid.lowercaseString;
+            // 绝不列:springboard(注入 respring 循环)、manager 自己(不分析自己)。
+            if ([lbid isEqualToString:@"com.apple.springboard"] || [lbid isEqualToString:@"com.iosdecrypthub.manager"]) continue;
+            BOOL isSystem = [bid hasPrefix:@"com.apple."];
+            BOOL enabled = [en containsObject:bid];
+            // 已启用一律留;否则:denylist 套所有 App(含用户 App,如测试 App);系统 App 还要桌面可见(有图标+SBAppTags 非隐藏)。
+            if (!enabled) {
+                if (appHomeDeny(bid)) continue;
+                if (isSystem && (appTagsNonHome(info[@"SBAppTags"]) || !appHasIcon(info))) continue;
+            }
+            NSString *name = info[@"CFBundleDisplayName"]; if (![name isKindOfClass:[NSString class]] || !name.length) name = info[@"CFBundleName"];
+            NSString *exec = info[@"CFBundleExecutable"];
+            apps[bid] = @{ @"bundle": bid, @"name": ([name isKindOfClass:[NSString class]] && name.length) ? name : bid,
+                           @"exec": ([exec isKindOfClass:[NSString class]] ? exec : @""),
+                           @"system": @([bid hasPrefix:@"com.apple."]) };
+        }
+    };
+    scan(@"/Applications"); scan(@"/var/jb/Applications");
+    for (NSString *c in [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil])
+        scan([@"/var/containers/Bundle/Application" stringByAppendingPathComponent:c]);
+    NSArray *out = [[apps allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        BOOL sa = [a[@"system"] boolValue], sb = [b[@"system"] boolValue];
+        if (sa != sb) return sa ? NSOrderedDescending : NSOrderedAscending;   // 用户 App 在前,系统在后
+        return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
+    }];
+    [lock lock]; cache = out; cacheT = now; [lock unlock];
+    return out;
+}
+// App 列表 + 启用/运行状态(供控制台 App tab)。
+static NSDictionary *controlAppData(void) {
+    NSSet *en = [NSSet setWithArray:cfgMembers(DH_KEY_BUNDLES)];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *a in enumApps()) {
+        NSString *exec = a[@"exec"];
+        int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
+        [out addObject:@{ @"bundle": a[@"bundle"], @"name": a[@"name"], @"system": a[@"system"],
+                          @"enabled": @([en containsObject:a[@"bundle"]]),
+                          @"running": @(pid != 0), @"pid": @(pid) }];
+    }
+    return @{ @"apps": out, @"engineVer": @ENGINE_VER };
+}
+// App 重启=结束进程(iOS App 非 launchd KeepAlive,kill 后由用户/系统重新打开时带上新注入)。按枚举到的
+// CFBundleExecutable 找 pid kill;只对枚举到的 App(不接受任意名),bundle 必须在 App 列表里。返回是否 kill。
+static BOOL killAppByBundle(NSString *bundle) {
+    for (NSDictionary *a in enumApps()) {
+        if (![a[@"bundle"] isEqual:bundle]) continue;
+        NSString *exec = a[@"exec"];
+        if (!exec.length) return NO;
+        int pid = dh_proc_alive([exec UTF8String]);
+        if (pid > 0) { kill(pid, SIGKILL); return YES; }
+        return NO;
+    }
+    return NO;
+}
+
+// POST /api/control/<action>:enable(kind=daemon/app)、restart(daemon)、restart-app(App)。
+static void handleControl(int fd, NSString *action, NSDictionary *q) {
+    if ([action isEqualToString:@"enable"]) {
+        BOOL on = [q[@"on"] intValue] != 0;
+        if ([q[@"kind"] isEqualToString:@"app"]) {
+            NSString *bundle = q[@"bundle"];
+            NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:
+                @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"];
+            if (!bundle.length || bundle.length > 128 || [[bundle stringByTrimmingCharactersInSet:ok] length]) {
+                sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle id"}); return; }
+            BOOL w = cfgSetMember(DH_KEY_BUNDLES, bundle, on);
+            sendJSON(fd, @{@"ok": @(w), @"enabled": @(cfgHasMember(DH_KEY_BUNDLES, bundle))}); return;
+        }
+        NSString *proc = q[@"proc"];
+        if (!validProc(proc) || !isWhitelisted(proc)) { sendJSON(fd, @{@"ok": @NO, @"err": @"未知进程"}); return; }
+        BOOL w = cfgSetMember(DH_KEY_EXECS, proc, on);
+        sendJSON(fd, @{@"ok": @(w), @"enabled": @(cfgHasMember(DH_KEY_EXECS, proc))}); return;
+    }
+    if ([action isEqualToString:@"restart"]) {
+        NSString *proc = q[@"proc"];
+        if (!validProc(proc) || !isWhitelisted(proc)) { sendJSON(fd, @{@"ok": @NO, @"err": @"未知进程"}); return; }
+        int rc = dh_restart_daemon([proc UTF8String]);
+        sendJSON(fd, @{@"ok": @(rc == 0)}); return;
+    }
+    if ([action isEqualToString:@"restart-app"]) {
+        NSString *bundle = q[@"bundle"];
+        if (![bundle isKindOfClass:[NSString class]] || !bundle.length) { sendJSON(fd, @{@"ok": @NO, @"err": @"缺 bundle"}); return; }
+        BOOL killed = killAppByBundle(bundle);
+        sendJSON(fd, @{@"ok": @(killed), @"note": killed ? @"已结束进程,重新打开即注入" : @"进程未在运行"}); return;
+    }
+    send404(fd);
+}
+
+// 控制台 SPA:静态壳(collector 同目录的 panel.html),前端 fetch /api/control/list 渲染。放独立文件而非
+// 内嵌 ObjC 字符串——JS 里嵌套引号多,内嵌极易出错;与 webui.html 同法托管。
+static NSString *indexHTML(void) {
+    static NSString *cached; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char exe[4096]; uint32_t sz = sizeof exe;
+        if (_NSGetExecutablePath(exe, &sz) != 0) return;
+        NSString *dir = [[NSString stringWithUTF8String:exe] stringByDeletingLastPathComponent];
+        cached = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"panel.html"]
+                                           encoding:NSUTF8StringEncoding error:nil];
+    });
+    return cached ?: @"<h3>panel.html 缺失(collector 同目录)</h3>";
 }
 
 // ———— 路由 ————
@@ -417,13 +640,25 @@ static void handleConn(int fd) {
         char *sp1 = strchr(buf, ' '); if (!sp1) { send404(fd); return; }
         char *sp2 = strchr(sp1 + 1, ' '); if (!sp2) { send404(fd); return; }
         BOOL isGet = (strncmp(buf, "GET ", 4) == 0);
+        BOOL isPost = (strncmp(buf, "POST ", 5) == 0);
         NSString *rawPath = [[NSString alloc] initWithBytes:sp1 + 1 length:(sp2 - sp1 - 1) encoding:NSUTF8StringEncoding];
         if (!rawPath) { send404(fd); return; }
         NSString *path = rawPath, *query = @"";
         NSRange qm = [rawPath rangeOfString:@"?"];
         if (qm.location != NSNotFound) { path = [rawPath substringToIndex:qm.location]; query = [rawPath substringFromIndex:qm.location + 1]; }
         path = [path stringByRemovingPercentEncoding] ?: path;
-        if (!isGet) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"仅支持 GET(历史为只读)" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+        // 控制台 API:list(GET)+ enable/restart(POST)
+        if ([path isEqualToString:@"/api/control/list"]) {
+            if (!isGet) { send404(fd); return; }
+            NSDictionary *q = parseQuery(query);
+            if ([q[@"kind"] isEqualToString:@"app"]) { sendJSON(fd, controlAppData()); return; }
+            sendJSON(fd, controlDaemonList()); return;
+        }
+        if ([path hasPrefix:@"/api/control/"]) {
+            if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"控制操作用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+            handleControl(fd, [path substringFromIndex:13], parseQuery(query)); return;   // "/api/control/"=13
+        }
+        if (!isGet) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"仅支持 GET" dataUsingEncoding:NSUTF8StringEncoding]); return; }
 
         if ([path isEqualToString:@"/"] || [path isEqualToString:@"/index.html"]) { sendHTML(fd, indexHTML()); return; }
         if (![path hasPrefix:@"/d/"]) { send404(fd); return; }

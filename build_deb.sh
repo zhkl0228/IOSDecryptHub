@@ -278,8 +278,9 @@ CTRL
     cp "$COMPANION_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     cp "$COMPANION_FILTER_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHCompanion.plist"
     cp "$COLLECTOR_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
-    # 引擎 WebUI 快照:collector 历史重建时原样托管(collector 用 _NSGetExecutablePath 定位同目录)。
+    # 引擎 WebUI 快照 + 聚合控制台 SPA:collector 托管(用 _NSGetExecutablePath 定位同目录)。
     cp "$SCRIPT_DIR/daemon/webui.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/webui.html"
+    cp "$SCRIPT_DIR/daemon/panel.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/panel.html"
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \

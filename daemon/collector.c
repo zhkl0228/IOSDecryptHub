@@ -19,6 +19,8 @@
 #include <pthread.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>      // posix_spawn(重启 daemon:launchctl kickstart)
+#include <sys/wait.h>   // waitpid
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -637,22 +639,78 @@ int dh_bridge_online(const char *proc, int *lan_port) {
     return 0;
 }
 
-// proc 进程当前是否存活(sysctl 查进程表),返回 pid(0=已退出)。用于区分「进程在但没注入引擎」与
-// 「进程已退出」。p_comm 被 MAXCOMLEN(16)截断,用 strncmp。
+// proc 进程当前是否存活(查进程表),返回 pid(0=已退出)。用于区分「进程在但没注入引擎」与「已退出」。
+// p_comm 被 MAXCOMLEN(16)截断,用 strncmp。进程表缓存 1 秒:控制台一次刷新对十几个 daemon 各查一次,
+// 不缓存就是十几次全进程枚举;缓存后复用一次。
+static pthread_mutex_t g_proc_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct kinfo_proc *g_proc_cache = NULL;
+static int g_proc_cache_cnt = 0;
+static time_t g_proc_cache_t = 0;
 int dh_proc_alive(const char *proc) {
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
-    size_t len = 0;
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || !len) return 0;
-    struct kinfo_proc *procs = malloc(len);
-    if (!procs) return 0;
-    int pid = 0;
-    if (sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
-        int cnt = (int)(len / sizeof(struct kinfo_proc));
-        for (int i = 0; i < cnt; i++)
-            if (strncmp(procs[i].kp_proc.p_comm, proc, MAXCOMLEN) == 0) { pid = procs[i].kp_proc.p_pid; break; }
+    pthread_mutex_lock(&g_proc_cache_lock);
+    time_t now = time(NULL);
+    if (!g_proc_cache || now != g_proc_cache_t) {   // 1 秒 TTL
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 }; size_t len = 0;
+        if (sysctl(mib, 4, NULL, &len, NULL, 0) == 0 && len) {
+            struct kinfo_proc *np = realloc(g_proc_cache, len);
+            if (np) {
+                g_proc_cache = np;
+                if (sysctl(mib, 4, g_proc_cache, &len, NULL, 0) == 0) { g_proc_cache_cnt = (int)(len / sizeof(struct kinfo_proc)); g_proc_cache_t = now; }
+                else g_proc_cache_cnt = 0;
+            }
+        }
     }
-    free(procs);
+    int pid = 0;
+    for (int i = 0; i < g_proc_cache_cnt; i++)
+        if (strncmp(g_proc_cache[i].kp_proc.p_comm, proc, MAXCOMLEN) == 0) { pid = g_proc_cache[i].kp_proc.p_pid; break; }
+    pthread_mutex_unlock(&g_proc_cache_lock);
     return pid;
+}
+
+// 按可执行名 kickstart 重启 daemon(companion 随之重新注入)。domain/label 取自 DH_DAEMON_LIST 的
+// 硬编码常量(绝不用请求里的 proc 拼命令,只用它 strcmp 匹配白名单;命令参数全是编译期常量,无注入),
+// user 域用 uid 501(mobile);collector 是 root,能 kickstart user/501。返回 0 成功。
+extern char **environ;
+int dh_restart_daemon(const char *proc) {
+    const char *dom = NULL, *lbl = NULL;
+    #define R(exec, disp, d, l, rst) if (strcmp(proc, exec) == 0) { dom = (d); lbl = (l); }
+    DH_DAEMON_LIST(R)
+    #undef R
+    if (!lbl) return -1;
+    char target[128];
+    if (strcmp(dom, "system") == 0) snprintf(target, sizeof target, "system/%s", lbl);
+    else snprintf(target, sizeof target, "%s/501/%s", dom, lbl);
+    const char *tools[] = { "/var/jb/usr/bin/launchctl", "/usr/bin/launchctl", "/bin/launchctl" };
+    for (int i = 0; i < 3; i++) {
+        if (access(tools[i], X_OK) != 0) continue;
+        char *const argv[] = { (char *)tools[i], "kickstart", "-k", target, NULL };
+        pid_t pid = 0;
+        if (posix_spawn(&pid, tools[i], NULL, NULL, argv, environ) != 0) continue;
+        int st = 0;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+            logts("[collector] 重启 %s -> %s", proc, target); return 0;
+        }
+    }
+    logts("[collector] 重启 %s 失败(%s)", proc, target);
+    return -1;
+}
+
+// 白名单 JSON(供聚合控制台列出所有可注入 daemon):[{"proc","disp","domain"}]。静态,建一次。
+// disp 都是无引号/反斜杠的中文名,直接内嵌安全。
+const char *dh_daemons_json(void) {
+    static char buf[4096]; static int built = 0;
+    if (!built) {
+        int o = 0, first = 1;
+        o += snprintf(buf + o, sizeof buf - o, "[");
+        #define J(exec, disp, dom, lbl, rst) do { \
+            o += snprintf(buf + o, sizeof buf - o, "%s{\"proc\":\"%s\",\"disp\":\"%s\",\"domain\":\"%s\"}", \
+                          first ? "" : ",", exec, disp, dom); first = 0; } while (0);
+        DH_DAEMON_LIST(J)
+        #undef J
+        o += snprintf(buf + o, sizeof buf - o, "]");
+        built = 1;
+    }
+    return buf;
 }
 
 extern void dh_agg_http_start(void);   // 聚合历史查询 HTTP 服务(collector_http.m),内部起线程即返回
