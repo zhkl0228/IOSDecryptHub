@@ -27,7 +27,15 @@
 #import <mach-o/dyld.h>   // _NSGetExecutablePath
 
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
-extern int  dh_bridge_online(const char *proc, int *lan_port);  // collector.c:proc 是否有活桥
+extern int  dh_bridge_online(const char *proc, int *lan_port);  // collector.c:引擎是否就绪(可连活引擎)
+extern int  dh_proc_alive(const char *proc);                    // collector.c:进程是否存活(sysctl),0=已退出
+
+// daemon 三态:live=引擎就绪可连活引擎 / idle=进程在但没注入引擎(未启用) / dead=进程已退出仅历史。
+// 返回并回填 lan_port(仅 live 有意义)。
+static NSString *procState(NSString *proc, int *lanPort) {
+    if (dh_bridge_online([proc UTF8String], lanPort)) return @"live";
+    return dh_proc_alive([proc UTF8String]) ? @"idle" : @"dead";
+}
 
 #define AGG_PORT 8089
 #define ENGINE_VER "1.27.3"   // 重建 stats 显示用(当前 vendor 引擎版本;仅展示)
@@ -103,34 +111,54 @@ static NSString *jstr(id v) { return [v isKindOfClass:[NSString class]] ? v : @"
 // ———— 载入 cap.jsonl → 归一化(去重 + tsMs 排序 + 赋稳定 _seq)————
 static NSString *capPath(NSString *proc) { return [NSString stringWithFormat:@"/var/log/dh-%@.cap.jsonl", proc]; }
 
+// 单次最多读 cap.jsonl 末尾 CAP_READ_MAX:旧实现把整文件读进内存(NSData + NSString + 全行数组 三份
+// 拷贝),会随文件增长撑爆 collector 的默认 jetsam 内存上限被 SIGKILL(实测 lockdownd 2.4MB 即触发,
+// 前台无此限则不崩)。改流式:NSFileHandle 分块读、复用行缓冲逐行解析,峰值只跟单行 + 结果集走;再对
+// 超大文件只读末尾(防 104MB 那种跑飞)。@autoreleasepool 每块回收行内临时对象。
+#define CAP_READ_MAX (4ull * 1024 * 1024)
 static NSArray<NSDictionary *> *loadEntries(NSString *proc) {
-    NSData *data = [NSData dataWithContentsOfFile:capPath(proc)];
-    if (!data) return @[];
-    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (!text) return @[];
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:capPath(proc)];
+    if (!fh) return @[];
+    unsigned long long size = [fh seekToEndOfFile];
+    BOOL tailed = size > CAP_READ_MAX;
+    [fh seekToFileOffset:tailed ? size - CAP_READ_MAX : 0];
     NSMutableArray<NSMutableDictionary *> *rows = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
     NSUInteger ord = 0, bad = 0;
-    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
-        if (line.length == 0) continue;
-        NSError *err = nil;
-        id obj = [NSJSONSerialization JSONObjectWithData:[line dataUsingEncoding:NSUTF8StringEncoding] options:0 error:&err];
-        if (![obj isKindOfClass:[NSDictionary class]]) {
-            // 严谨:不静默吞。坏行记日志(含前 120 字节)后跳过——companion 用 NSJSONSerialization 生成,
-            // 出现坏行必是真 bug(截断/环回绕越界),要能被看见。
-            if (bad++ < 3) aggLog([NSString stringWithFormat:@"[agg] %@ cap.jsonl 坏行(跳过): %@", proc,
-                line.length > 120 ? [line substringToIndex:120] : line]);
-            continue;
+    NSMutableData *line = [NSMutableData data];
+    BOOL dropPartial = tailed;   // 从中间开读,首个可能是半行 → 丢到第一个换行
+    NSData *chunk;
+    while ((chunk = [fh readDataOfLength:(1u << 16)]).length > 0) {
+        @autoreleasepool {
+            const uint8_t *b = chunk.bytes; NSUInteger n = chunk.length, s = 0;
+            for (NSUInteger i = 0; i < n; i++) {
+                if (b[i] != '\n') continue;
+                [line appendBytes:b + s length:i - s]; s = i + 1;
+                if (dropPartial) { dropPartial = NO; line.length = 0; continue; }
+                if (line.length == 0) continue;
+                id obj = [NSJSONSerialization JSONObjectWithData:line options:0 error:NULL];
+                if (![obj isKindOfClass:[NSDictionary class]]) {
+                    // 严谨:不静默吞。坏行记日志(前 120 字节)后跳过——companion 用 NSJSONSerialization
+                    // 生成,坏行必是真 bug(截断/环回绕越界),要能被看见。
+                    if (bad++ < 3) {
+                        NSString *p = [[NSString alloc] initWithData:[line subdataWithRange:NSMakeRange(0, MIN(line.length, (NSUInteger)120))] encoding:NSUTF8StringEncoding];
+                        aggLog([NSString stringWithFormat:@"[agg] %@ cap.jsonl 坏行(跳过): %@", proc, p ?: @"<非 UTF-8>"]);
+                    }
+                    line.length = 0; continue;
+                }
+                NSDictionary *r = obj;
+                // 去重:同一条(backfill 与流式罕见重叠)= 原始 seq+tsMs+tid 全同;跨实例 tsMs 不同 → 不误并。
+                NSString *k = [NSString stringWithFormat:@"%lld|%lld|%lld", jint(r[@"seq"]), jint(r[@"tsMs"]), jint(r[@"tid"])];
+                if (![seen containsObject:k]) {
+                    [seen addObject:k];
+                    NSMutableDictionary *m = [r mutableCopy]; m[@"_ord"] = @(ord++); [rows addObject:m];
+                }
+                line.length = 0;
+            }
+            [line appendBytes:b + s length:n - s];   // 尾部残留(跨块的半行),下块续上
         }
-        NSDictionary *r = obj;
-        // 去重:同一条(backfill 与流式罕见重叠)= 原始 seq+tsMs+tid 全同;跨实例 tsMs 不同 → 不误并。
-        NSString *k = [NSString stringWithFormat:@"%lld|%lld|%lld", jint(r[@"seq"]), jint(r[@"tsMs"]), jint(r[@"tid"])];
-        if ([seen containsObject:k]) continue;
-        [seen addObject:k];
-        NSMutableDictionary *m = [r mutableCopy];
-        m[@"_ord"] = @(ord++);
-        [rows addObject:m];
     }
+    // 文件末尾无换行的半行不完整,丢弃(不 parse)。
     // 按 tsMs 升序(引擎 backfill 的 snapshot 可能按分类而非时序);tie 用原文件序,确定稳定。
     [rows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         long long ta = jint(a[@"tsMs"]), tb = jint(b[@"tsMs"]);
@@ -182,22 +210,24 @@ static NSDictionary *statsFor(NSString *proc, NSArray<NSDictionary *> *entries) 
     for (NSDictionary *r in entries) { NSInteger b = catBucket((NSInteger)jint(r[@"cat"])); byCat[b] = @([byCat[b] intValue] + 1); }
     NSArray *names = @[@"digest",@"hmac",@"sym",@"asym",@"file",@"sys",@"net",@"keychain",@"other"];
     NSProcessInfo *pi = [NSProcessInfo processInfo];
-    int lanPort = 0; BOOL online = dh_bridge_online([proc UTF8String], &lanPort) != 0;
+    int lanPort = 0; NSString *state = procState(proc, &lanPort);   // live / idle / dead
+    BOOL live = [state isEqualToString:@"live"];
+    int pid = dh_proc_alive([proc UTF8String]);
     NSDictionary *process = @{
         @"deviceModel": deviceModel(), @"arch": @"arm64e", @"appName": @"",
         @"physicalMemoryMB": @((long long)(pi.physicalMemory / (1024 * 1024))),
         @"bundleId": @"", @"processName": proc,
-        @"systemVersion": pi.operatingSystemVersionString ?: @"", @"pid": @0,
+        @"systemVersion": pi.operatingSystemVersionString ?: @"", @"pid": @(pid),
     };
     return @{
         @"paused": @NO, @"noiseEnabled": @[@YES, @YES], @"version": @ENGINE_VER,
         @"logBytes": @0, @"total": @(entries.count), @"categoryNames": names,
         // health.summary 引擎专用于「真实健康故障」——非空即弹红条「失效: …」+ 红点告警。历史重建是
-        // 正常态,故留空(像健康引擎);在线/历史的区分只放索引页,不在此误报「失效」。
+        // 正常态,故留空(像健康引擎);三态区分放索引页 + 顶部胶囊(读 state),不在此误报「失效」。
         @"health": @{ @"hookFails": @0, @"httpFailed": @NO, @"localOnly": @NO, @"persistFailed": @NO, @"summary": @"" },
         @"noiseCount": @[@0, @0], @"pausedByCat": @[@NO,@NO,@NO,@NO,@NO,@NO,@NO,@NO,@NO],
-        @"byCategory": byCat, @"port": @(online ? lanPort : 0), @"history": @YES,
-        @"alive": @(online),   // 进程是否存活(有活桥即在跑);WebUI 顶部据此显示 运行中/已退出
+        @"byCategory": byCat, @"port": @(live ? lanPort : 0), @"history": @YES,
+        @"state": state,        // live=引擎就绪可连活引擎 / idle=进程在未注入引擎 / dead=已退出仅历史
         @"process": process,
     };
 }
@@ -252,14 +282,14 @@ static NSString *webuiForProc(NSString *proc) {
                           options:0 range:NSMakeRange(0, h.length)];
     [h replaceOccurrencesOfString:@"'/download" withString:[NSString stringWithFormat:@"'%@/download", pfx]
                           options:0 range:NSMakeRange(0, h.length)];
-    // 顶部状态标记进程死活:引擎胶囊原本只有 已暂停/运行中,对已退出的 daemon 也显示"运行中"(误导)。
-    // 快照是我们自己 vendor 的,这里改写那两句(文案+圆点)读 stats.alive。改写失配(引擎升级换了文本)
-    // 只会退回原样,不崩。
+    // 顶部胶囊标三态:引擎胶囊原本只有 已暂停/运行中,分不清「进程退了/进程在但没注入引擎/引擎就绪」。
+    // 快照是我们自己 vendor 的,这里改写那两句(文案+圆点)读 stats.state(live/idle/dead)。改写失配
+    // (引擎升级换了文本)只会退回原样,不崩。
     [h replaceOccurrencesOfString:@"stats.paused ? '已暂停' : '运行中'"
-                      withString:@"stats.alive===false ? '已退出' : (stats.paused ? '已暂停' : '运行中')"
+                      withString:@"stats.state==='dead' ? '已退出' : (stats.state==='idle' ? '进程在·未注入引擎' : (stats.paused ? '已暂停' : '运行中'))"
                          options:0 range:NSMakeRange(0, h.length)];
     [h replaceOccurrencesOfString:@"(stats.health && stats.health.summary) ? 'err' : (stats.paused ? 'paused' : 'ok')"
-                      withString:@"stats.alive===false ? 'paused' : ((stats.health && stats.health.summary) ? 'err' : (stats.paused ? 'paused' : 'ok'))"
+                      withString:@"stats.state!=='live' ? 'paused' : ((stats.health && stats.health.summary) ? 'err' : (stats.paused ? 'paused' : 'ok'))"
                          options:0 range:NSMakeRange(0, h.length)];
     return h;
 }
@@ -279,7 +309,7 @@ static NSString *indexHTML(void) {
         "h1{font-size:20px;margin:0 0 16px}table{border-collapse:collapse;width:100%;max-width:900px}"
         "th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #232838}th{color:#8b93a7;font-weight:600}"
         "a{color:#7fd6df;text-decoration:none}a:hover{text-decoration:underline}"
-        ".on{color:#5fd08a}.off{color:#8b93a7}.n{color:#c8cede;font-variant-numeric:tabular-nums}"
+        ".on{color:#5fd08a}.idle{color:#d8b24a}.off{color:#8b93a7}.n{color:#c8cede;font-variant-numeric:tabular-nums}"
         "</style><h1>IOSDecryptHub · daemon 捕获聚合</h1>"];
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/log" error:nil];
     NSMutableArray *procs = [NSMutableArray array];
@@ -292,15 +322,17 @@ static NSString *indexHTML(void) {
     for (NSString *proc in procs) {
         if (!validProc(proc)) continue;
         NSArray *entries = loadEntries(proc);
-        int lanPort = 0; BOOL online = dh_bridge_online([proc UTF8String], &lanPort) != 0;
+        int lanPort = 0; NSString *state = procState(proc, &lanPort);   // live / idle / dead
+        BOOL live = [state isEqualToString:@"live"];
+        NSString *cls = live ? @"on" : ([state isEqualToString:@"idle"] ? @"idle" : @"off");
+        NSString *label = live ? @"引擎就绪" : ([state isEqualToString:@"idle"] ? @"进程在·未注入" : @"已退出");
         long long lastMs = entries.count ? jint([entries lastObject][@"tsMs"]) : 0;
         [h appendFormat:@"<tr><td><a href='/d/%@/'>%@</a></td>"
             "<td class='%@'>%@</td><td class=n>%lu</td><td class=n>%@</td><td>%@</td></tr>",
-            proc, proc,
-            online ? @"on" : @"off", online ? @"在线" : @"历史",
+            proc, proc, cls, label,
             (unsigned long)entries.count,
             lastMs ? fmtTs(lastMs) : @"—",
-            online ? [NSString stringWithFormat:@"<a class=live href='#' data-port='%d'>连活引擎</a>", lanPort] : @""];
+            live ? [NSString stringWithFormat:@"<a class=live href='#' data-port='%d'>连活引擎</a>", lanPort] : @""];
     }
     // 活引擎在各自 LAN 端口,链接的 host 服务端不知道 → 用浏览器 location.hostname 补全。
     [h appendString:@"</table><script>document.querySelectorAll('a.live').forEach(function(a){"

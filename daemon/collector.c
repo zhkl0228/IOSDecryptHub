@@ -44,7 +44,8 @@ extern kern_return_t task_for_pid(mach_port_t target, int pid, mach_port_t *task
 typedef struct {
     char  proc[DH_PROC_MAX];
     int   used;
-    int   online;
+    int   online;                 // CONTROL 活体:companion 已注入并报活体(socket 桥无条件起,≠引擎就绪)
+    int   engine_ready;           // 引擎真架桥:收到过 DATA 连接(引擎 dlopen 后必 accept→connect-out)=可连活引擎
     int   lan_port;
     int   lan_fd;                 // LAN 监听 fd,-1 未绑
     int   pool[POOL_MAX];         // 池住的引擎数据连接 fd
@@ -212,7 +213,7 @@ static void *control_reader(void *arg) {
     char buf[64];
     while (read(fd, buf, sizeof buf) > 0) { /* 未来命令通道 */ }
     close(fd);
-    pthread_mutex_lock(&g_lock); t->online = 0; pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&g_lock); t->online = 0; t->engine_ready = 0; pthread_mutex_unlock(&g_lock);
     // 目标进程已退出(如 kickstart):池里残留的待命 DATA 连接都成了僵尸,清掉,
     // 否则下一个 LAN 请求会 splice 到一条对端已死的连接。
     pthread_mutex_lock(&t->lock);
@@ -249,6 +250,7 @@ static void *accept_thread(void *arg) {
             if (pthread_create(&th, NULL, file_reader, pair) == 0) pthread_detach(th);
             else { close(c); free(pair[1]); free(pair); }
         } else { // DATA
+            pthread_mutex_lock(&g_lock); t->engine_ready = 1; pthread_mutex_unlock(&g_lock);   // 引擎已 dlopen 并 accept
             target_ensure_lan(t);
             pthread_mutex_lock(&t->lock);
             if (t->pool_n < POOL_MAX) { t->pool[t->pool_n++] = c; pthread_cond_signal(&t->cond); logts("[collector] %s DATA 入池 pool_n=%d", h.proc, t->pool_n); pthread_mutex_unlock(&t->lock); }
@@ -624,14 +626,33 @@ static void *mem_bridge_manager(void *arg) {
 // —— 供聚合 HTTP 模块(collector_http.m)调用的桥接 ——
 void dh_log(const char *s) { logts("%s", s); }
 
-// proc 当前是否有活桥(内存桥 g_mb 或 socket 桥 g_t.online),有则回其 LAN 端口。无锁读:g_mb 结构
-// 故意不 free(见 mb_teardown),g_t 槽复用但 proc/online 是良性竞态,索引页用途容忍瞬时不一致。
+// proc 的引擎是否**就绪可连活引擎**(≠仅 companion 活体):内存桥在 g_mb(engine_port 已确认)、
+// socket 桥 engine_ready(收到过 DATA=引擎已 dlopen 并 accept)。有则回其 LAN 端口。无锁读:g_mb 结构
+// 故意不 free(见 mb_teardown),g_t 槽复用但 proc/标志是良性竞态,索引页用途容忍瞬时不一致。
 int dh_bridge_online(const char *proc, int *lan_port) {
     for (int i = 0; i < g_mb_n; i++)
         if (strcmp(g_mb[i]->proc, proc) == 0) { if (lan_port) *lan_port = g_mb[i]->lan_port; return 1; }
     for (int i = 0; i < MAX_TARGETS; i++)
-        if (g_t[i].used && g_t[i].online && strcmp(g_t[i].proc, proc) == 0) { if (lan_port) *lan_port = g_t[i].lan_port; return 1; }
+        if (g_t[i].used && g_t[i].engine_ready && strcmp(g_t[i].proc, proc) == 0) { if (lan_port) *lan_port = g_t[i].lan_port; return 1; }
     return 0;
+}
+
+// proc 进程当前是否存活(sysctl 查进程表),返回 pid(0=已退出)。用于区分「进程在但没注入引擎」与
+// 「进程已退出」。p_comm 被 MAXCOMLEN(16)截断,用 strncmp。
+int dh_proc_alive(const char *proc) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || !len) return 0;
+    struct kinfo_proc *procs = malloc(len);
+    if (!procs) return 0;
+    int pid = 0;
+    if (sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
+        int cnt = (int)(len / sizeof(struct kinfo_proc));
+        for (int i = 0; i < cnt; i++)
+            if (strncmp(procs[i].kp_proc.p_comm, proc, MAXCOMLEN) == 0) { pid = procs[i].kp_proc.p_pid; break; }
+    }
+    free(procs);
+    return pid;
 }
 
 extern void dh_agg_http_start(void);   // 聚合历史查询 HTTP 服务(collector_http.m),内部起线程即返回
