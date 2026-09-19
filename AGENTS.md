@@ -24,7 +24,7 @@ ElleKit 把 `IOSDecryptHubLoader.dylib` 装进 UIKit App → 读 `enabledBundles
 
 ## 通用
 - **引擎**(`vendor/dylib/{rootless,roothide}/decrypt_helper.dylib`,闭源):由 `tools/vendor_engine.sh <ver>`
-  从上游 release 同步(arm64e 切片自动过 `tools/patch_engine_arm64e_pac.py` 打 PAC 补丁);当前 **1.27.3**。
+  从上游 release 同步(arm64e 切片自动过 `tools/patch_engine_arm64e_pac.py` 打 PAC 补丁);版本以 `Makefile` 的 `VERSION` 为准。
 - **updater daemon**(`com.iosdecrypthub.updated`):一次性——launchd 按需拉起、跑完即退,只做引擎更新检查/安装/回滚,
   不 hook、不常驻、不监听端口。
 - **版本号**:`Makefile` 的 `VERSION`。
