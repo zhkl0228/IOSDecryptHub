@@ -297,7 +297,8 @@ static int mb_read_cstr(mach_port_t task, uint64_t addr, char *out, size_t cap) 
 }
 
 
-static uint64_t mb_companion_base(mach_port_t task) {
+// 在目标进程的 dyld image 列表里找镜像名含 needle 的基址(companion / loader 通用)。
+static uint64_t mb_image_base(mach_port_t task, const char *needle) {
     task_dyld_info_data_t di; mach_msg_type_number_t c = TASK_DYLD_INFO_COUNT;
     if (task_info(task, TASK_DYLD_INFO, (task_info_t)&di, &c) != KERN_SUCCESS) return 0;
     struct dyld_all_image_infos aii;
@@ -312,15 +313,16 @@ static uint64_t mb_companion_base(mach_port_t task) {
         for (uint32_t i = 0; i < n; i++) {
             char path[512] = {0};
             if (mb_read_cstr(task, (uint64_t)arr[i].imageFilePath, path, sizeof path) != 0) continue;
-            if (strstr(path, "DHCompanion")) { base = (uint64_t)arr[i].imageLoadAddress; break; }
+            if (strstr(path, needle)) { base = (uint64_t)arr[i].imageLoadAddress; break; }
         }
     }
     free(arr);
     return base;
 }
+static uint64_t mb_companion_base(mach_port_t task) { return mb_image_base(task, "DHCompanion"); }
 
-// 从 companion 镜像基址附近扫 DH_SHM_MAGIC,定位 g_dh_shm 运行时地址。
-static uint64_t mb_find_shm(mach_port_t task, uint64_t base) {
+// 从镜像基址附近的可写段扫 magic,定位对应全局结构的运行时地址。
+static uint64_t mb_scan_magic(mach_port_t task, uint64_t base, uint32_t magic) {
     vm_address_t addr = (vm_address_t)base;
     for (int r = 0; r < 256; r++) {
         vm_size_t size = 0; vm_region_basic_info_data_64_t info;
@@ -332,12 +334,37 @@ static uint64_t mb_find_shm(mach_port_t task, uint64_t base) {
                 uint32_t buf[1024]; vm_size_t rd = 0;
                 if (vm_read_overwrite(task, p, sizeof buf, (vm_address_t)buf, &rd) != KERN_SUCCESS) continue;
                 for (size_t k = 0; k * 4 < rd; k++)
-                    if (buf[k] == DH_SHM_MAGIC) return (uint64_t)(p + k * 4);
+                    if (buf[k] == magic) return (uint64_t)(p + k * 4);
             }
         }
         addr += size;
     }
     return 0;
+}
+static uint64_t mb_find_shm(mach_port_t task, uint64_t base) { return mb_scan_magic(task, base, DH_SHM_MAGIC); }
+
+// [App 共享内存发现] task_for_pid(App)+ 找 IOSDecryptHubLoader 镜像 + 扫 DH_APP_REG_MAGIC + vm_read
+// struct dh_app_reg。比端口扫描完整——后台被挂起的 App 内存也可读。返回 1=读到(回填 port/bundle/version)。
+int dh_app_mem_read(int pid, uint32_t *port, char *bundle, size_t bcap, char *ver, size_t vcap) {
+    mach_port_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return 0;
+    int found = 0;
+    uint64_t base = mb_image_base(task, "IOSDecryptHubLoader");
+    if (base) {
+        uint64_t a = mb_scan_magic(task, base, DH_APP_REG_MAGIC);
+        if (a) {
+            struct dh_app_reg r;
+            if (mb_rd(task, a, &r, sizeof r) == 0 && r.magic == DH_APP_REG_MAGIC) {
+                if (port) *port = r.port;
+                r.bundle[sizeof(r.bundle) - 1] = 0; r.version[sizeof(r.version) - 1] = 0;
+                if (bundle && bcap) { strncpy(bundle, r.bundle, bcap - 1); bundle[bcap - 1] = 0; }
+                if (ver && vcap) { strncpy(ver, r.version, vcap - 1); ver[vcap - 1] = 0; }
+                found = 1;
+            }
+        }
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return found;
 }
 #define MB_CONN(shm, i)  ((shm) + offsetof(dh_shm_t, conn) + (uint64_t)(i) * sizeof(dh_conn_t))
 #define MB_F(ca, field)  ((ca) + offsetof(dh_conn_t, field))

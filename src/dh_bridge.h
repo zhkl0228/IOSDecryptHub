@@ -26,6 +26,19 @@ enum {
     DH_CONN_CAP     = 3,   // 结构化捕获 JSON-lines 流:普通(socket 桥)daemon 的 companion swizzle
                            // _persist: 把每条 DHLogEntry 序列化后推本连接,collector 落盘
                            // /var/log/dh-<proc>.cap.jsonl(与内存桥同文件,聚合层统一)。严格 daemon 走 cap_ring。
+    // 注:曾加过 DH_CONN_APP_REG(App loader socket 向 collector 注册),但第三方 App 沙盒禁 connect 本 socket,
+    // 已撤;App 引擎发现改走**共享内存**:loader 把下面 dh_app_reg 填进 App 进程全局,collector task_for_pid(App)
+    // (实测第三方 App 也能)+ 扫 loader 镜像 magic + vm_read。比端口扫描完整——后台被挂起的 App 内存也可读。
+};
+
+// App(线 A)注册信息:loader 填进 App 进程内的全局变量(带 magic),collector vm_read 定位读出。
+#define DH_APP_REG_MAGIC 0x44484152u   // 'DHAR'
+struct dh_app_reg {
+    volatile uint32_t magic;    // DH_APP_REG_MAGIC —— loader 把其余字段写好后**最后**置,collector 扫到即字段就绪
+    volatile uint32_t port;     // 引擎 dh_http_port()
+    volatile uint32_t pid;
+    char     bundle[128];       // bundle id
+    char     version[16];       // 引擎版本(loader 无导出 getter,留空由 collector 用 ENGINE_VER)
 };
 
 // 懒连接握手:companion 的 my_accept 建一条 DATA 连接后**阻塞**读这一个字节,

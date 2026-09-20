@@ -10,6 +10,10 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <syslog.h>
+#import <pthread.h>
+#import <unistd.h>
+#import <string.h>
+#import "dh_bridge.h"   // struct dh_app_reg / DH_APP_REG_MAGIC(collector task_for_pid + vm_read 读)
 
 #define LOADER_TAG      "[IOSDecryptHub]"
 #define PREFS_DOMAIN    @"com.iosdecrypthub.loader"
@@ -123,6 +127,31 @@ static BOOL dh_should_inject(NSString *bundleID) {
     return hit;
 }
 
+// App 注册信息全局(collector task_for_pid + vm_read 定位读)。App 沙盒禁 connect collector socket,故不主动
+// 上报,而是把信息留在自己内存里由 collector 反读——比端口扫描完整(后台被挂起的 App 内存也可读)。
+// used 属性防被优化掉;放 loader 镜像里,collector 扫 IOSDecryptHubLoader 镜像的 magic 定位。
+struct dh_app_reg g_dh_app_reg __attribute__((used));
+
+// dlopen 引擎后:等 dh_http_port() 就绪(引擎 HTTP server 异步 bind)→ 填 g_dh_app_reg(bundle/port/pid,
+// 最后置 magic)。引擎版本无导出 getter,留空由 collector 用 ENGINE_VER。
+static void *dh_app_reg_fill(void *arg) {
+    void *handle = arg;
+    int (*port_fn)(void) = (int (*)(void))dlsym(handle, "dh_http_port");
+    uint32_t port = 0;
+    for (int i = 0; i < 120; i++) {   // ≤12s 等 bind
+        if (port_fn) port = (uint32_t)port_fn();
+        if (port) break;
+        usleep(100000);
+    }
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    strncpy(g_dh_app_reg.bundle, bid.UTF8String ?: "", sizeof(g_dh_app_reg.bundle) - 1);
+    g_dh_app_reg.port = port;
+    g_dh_app_reg.pid = (uint32_t)getpid();
+    __sync_synchronize();
+    g_dh_app_reg.magic = DH_APP_REG_MAGIC;   // 最后置:collector 扫到 magic 时其余字段已写好
+    return NULL;
+}
+
 __attribute__((constructor))
 static void dh_loader_init(void) {
     @autoreleasepool {
@@ -139,7 +168,12 @@ static void dh_loader_init(void) {
             syslog(LOG_INFO, LOADER_TAG " 注入 %s → %s",
                    bundleID.UTF8String, dylibPath.UTF8String);
             void *handle = dlopen(dylibPath.fileSystemRepresentation, RTLD_NOW);
-            if (handle) return;
+            if (handle) {
+                // 注入成功 → 起线程填 g_dh_app_reg(端口就绪后),供 collector vm_read 发现「已注入」+端口/版本。
+                pthread_t th;
+                if (pthread_create(&th, NULL, dh_app_reg_fill, handle) == 0) pthread_detach(th);
+                return;
+            }
         }
         syslog(LOG_ERR, LOADER_TAG " 主 dylib 加载失败 (%s): %s",
                bundleID.UTF8String, dlerror() ?: "unknown error");

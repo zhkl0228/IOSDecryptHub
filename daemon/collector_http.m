@@ -26,12 +26,16 @@
 #import <sys/sysctl.h>
 #import <mach-o/dyld.h>   // _NSGetExecutablePath
 #import <signal.h>        // kill(App 重启=结束进程)
+#import <spawn.h>         // posix_spawn(uiopen 启动 App)
+#import <sys/wait.h>      // waitpid
+extern char **environ;
 
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
 extern int  dh_bridge_online(const char *proc, int *lan_port);  // collector.c:引擎是否就绪(可连活引擎)
 extern int  dh_proc_alive(const char *proc);                    // collector.c:进程是否存活(sysctl),0=已退出
 extern int  dh_restart_daemon(const char *proc);                // collector.c:kickstart 重启 daemon,0=成功
 extern const char *dh_daemons_json(void);                       // collector.c:白名单 [{proc,disp,domain}]
+extern int  dh_app_mem_read(int pid, uint32_t *port, char *bundle, size_t bcap, char *ver, size_t vcap);  // App vm_read 发现
 
 // 注入门控 config(companion dh_enabled / collector mb_is_enabled 都读这份;与它们同路径)。
 #define DH_CFG_PATH @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
@@ -489,21 +493,59 @@ static NSArray *enumApps(void) {
     [lock lock]; cache = out; cacheT = now; [lock unlock];
     return out;
 }
-// App 列表 + 启用/运行状态(供控制台 App tab)。
-static NSDictionary *controlAppData(void) {
-    NSSet *en = [NSSet setWithArray:cfgMembers(DH_KEY_BUNDLES)];
-    NSMutableArray *out = [NSMutableArray array];
+// App 引擎发现(共享内存):对每个 running App 做 task_for_pid + vm_read loader 的 g_dh_app_reg,得
+// bundle→@[port,ver]。比端口扫描完整——后台被挂起的 App 内存也可读(端口扫描后台扫不到)。缓存 5s。
+static NSDictionary *appInjectMap(void) {
+    static NSDictionary *cache; static NSTimeInterval t; static NSLock *lk; static dispatch_once_t o;
+    dispatch_once(&o, ^{ lk = [NSLock new]; });
+    [lk lock]; NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (cache && now - t < 5) { NSDictionary *c = cache; [lk unlock]; return c; }
+    [lk unlock];
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
     for (NSDictionary *a in enumApps()) {
         NSString *exec = a[@"exec"];
         int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
-        [out addObject:@{ @"bundle": a[@"bundle"], @"name": a[@"name"], @"system": a[@"system"],
-                          @"enabled": @([en containsObject:a[@"bundle"]]),
-                          @"running": @(pid != 0), @"pid": @(pid) }];
+        if (!pid) continue;
+        uint32_t port = 0; char b[128] = {0}, v[16] = {0};
+        if (dh_app_mem_read(pid, &port, b, sizeof b, v, sizeof v))
+            m[a[@"bundle"]] = @[@(port), (v[0] ? @(v) : @"")];
+    }
+    [lk lock]; cache = m; t = now; [lk unlock];
+    return m;
+}
+// App 列表 + 启用/运行/注入/端口/版本(供控制台 App tab)。
+static NSDictionary *controlAppData(void) {
+    NSSet *en = [NSSet setWithArray:cfgMembers(DH_KEY_BUNDLES)];
+    NSDictionary *ports = appInjectMap();
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *a in enumApps()) {
+        NSString *bundle = a[@"bundle"], *exec = a[@"exec"];
+        int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
+        NSArray *pe = ports[bundle];   // @[port, ver] 或 nil(未注入)
+        BOOL injected = pe != nil;
+        [out addObject:@{ @"bundle": bundle, @"name": a[@"name"], @"system": a[@"system"],
+                          @"enabled": @([en containsObject:bundle]),
+                          @"running": @(pid != 0), @"pid": @(pid),
+                          @"injected": @(injected),
+                          @"port": injected ? pe[0] : @0,
+                          @"version": injected ? ([pe[1] length] ? pe[1] : @ENGINE_VER) : @"" }];
     }
     return @{ @"apps": out, @"engineVer": @ENGINE_VER };
 }
 // App 重启=结束进程(iOS App 非 launchd KeepAlive,kill 后由用户/系统重新打开时带上新注入)。按枚举到的
 // CFBundleExecutable 找 pid kill;只对枚举到的 App(不接受任意名),bundle 必须在 App 列表里。返回是否 kill。
+// 启动 App:daemon 直接调 SpringBoardServices 的 SBSLaunchApplicationWithIdentifier 权限不足(实测失败),
+// 改用越狱工具 uiopen --bundleid(它有正确上下文,实测可拉起 App)。
+static BOOL launchApp(NSString *bundle) {
+    const char *tool = "/var/jb/usr/bin/uiopen";
+    if (access(tool, X_OK) != 0) tool = "/usr/bin/uiopen";
+    if (access(tool, X_OK) != 0) return NO;
+    char *const argv[] = { (char *)tool, "--bundleid", (char *)[bundle UTF8String], NULL };
+    pid_t pid = 0;
+    if (posix_spawn(&pid, tool, NULL, NULL, argv, environ) != 0) return NO;
+    int st = 0;
+    return waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
 static BOOL killAppByBundle(NSString *bundle) {
     for (NSDictionary *a in enumApps()) {
         if (![a[@"bundle"] isEqual:bundle]) continue;
@@ -544,7 +586,11 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         NSString *bundle = q[@"bundle"];
         if (![bundle isKindOfClass:[NSString class]] || !bundle.length) { sendJSON(fd, @{@"ok": @NO, @"err": @"缺 bundle"}); return; }
         BOOL killed = killAppByBundle(bundle);
-        sendJSON(fd, @{@"ok": @(killed), @"note": killed ? @"已结束进程,重新打开即注入" : @"进程未在运行"}); return;
+        if (killed) usleep(400000);   // 等旧进程退干净再启动,否则 SBSLaunch 会前台已有实例(不重启)
+        BOOL launched = launchApp(bundle);
+        sendJSON(fd, @{@"ok": @(launched), @"killed": @(killed), @"launched": @(launched),
+                       @"note": launched ? @"已重启(引擎随之注入)" : (killed ? @"已结束但启动失败(daemon 拉起 App 权限不足?手动打开)" : @"未在运行,尝试启动失败") });
+        return;
     }
     send404(fd);
 }

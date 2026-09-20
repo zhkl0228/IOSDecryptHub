@@ -117,17 +117,21 @@ function renderA(){
   var kw = (f ? f.value : "").trim().toLowerCase();
   var list = _apps.filter(function(x){ return !kw || (x.name+" "+x.bundle).toLowerCase().indexOf(kw)>=0; });
   document.getElementById("acnt").textContent = list.length+" 个";
-  var h = '<table><tr><th>App</th><th>PID</th><th>注入</th><th>运行</th><th>操作</th></tr>';
+  var h = '<table><tr><th>App</th><th>PID</th><th>注入</th><th>运行</th><th>引擎</th><th>操作</th></tr>';
   list.forEach(function(x){
+    var eng = !x.injected ? '<span class="off">—</span>'
+            : '<span class="on">已注入</span> '+(x.version?esc(x.version):'')
+              +' <a class="btn" href="http://'+H+':'+x.port+'/" target="_blank">连活引擎 :'+x.port+'</a>';
     h += '<tr><td>'+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
       +  '<div class="muted">'+esc(x.bundle)+'</div></td>'
       +  '<td>'+pidCell(x.pid)+'</td>'
       +  '<td><label class="sw"><input type="checkbox" '+(x.enabled?"checked":"")
       +      ' onchange="togA(\''+esc(x.bundle)+'\',this.checked)"><span class="sl"></span></label></td>'
       +  '<td>'+(x.running?'<span class="on">运行中</span>':'<span class="off">未运行</span>')+'</td>'
+      +  '<td>'+eng+'</td>'
       +  '<td>'+(x.running?'<button class="btn" onclick="rstA(\''+esc(x.bundle)+'\')">重启</button>':'<span class="muted">—</span>')+'</td></tr>';
   });
-  if(!list.length) h += '<tr><td class="muted" colspan="5">无匹配</td></tr>';
+  if(!list.length) h += '<tr><td class="muted" colspan="6">无匹配</td></tr>';
   h += '</table>';
   document.getElementById("atbl").innerHTML = h;
 }
