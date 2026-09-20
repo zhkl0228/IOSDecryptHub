@@ -125,7 +125,7 @@ async function loadA(){
   var sc=document.getElementById("scr");
   if(sc){
     var lk=a.locked, on=a.screenOn;   // lk: 1锁 0解 -1未知
-    var t = lk===1?"🔒 锁屏" : (lk===0?"🔓 已解锁" : (on?"亮屏":"息屏"));
+    var t = lk===1?"🔒 锁屏" : (lk===0?"🟢 已解锁" : (on?"亮屏":"息屏"));
     sc.textContent = t + " · " + (on?"亮":"息") + (lk===-1?"(装 DHUnlock 显示锁屏态)":"");
   }
   renderA();
@@ -182,6 +182,13 @@ async function fridaClearLog(b){
   try{ await fetch("/api/frida/clearlog",{method:"POST"}); }catch(e){}
   var el=document.getElementById("flog"); if(el) el.textContent="(已清空)";
 }
+async function fridaDelete(b){
+  if(!confirm("清空该 App 的 Frida 脚本?(删除已保存的 JS,之后启动/重启不再注入)")) return;
+  try{ var j=await (await fetch("/api/frida/delete?bundle="+encodeURIComponent(b),{method:"POST"})).json();
+    if(j.ok){ var t=document.getElementById("fjs"); if(t)t.value=""; var m=document.getElementById("fmsg"); if(m)m.textContent="已清空脚本"; loadA(); }
+    else { var m=document.getElementById("fmsg"); if(m)m.textContent="失败:"+(j.err||""); }
+  }catch(e){ var m=document.getElementById("fmsg"); if(m)m.textContent="网络错误"; }
+}
 function fridaUpload(inp){
   var f=inp.files&&inp.files[0]; if(!f){ return; }
   var r=new FileReader();
@@ -221,6 +228,7 @@ async function fridaEdit(b,name){
     +'<div class="frow"><label class="btn">上传 JS<input type="file" accept=".js,.txt,text/javascript" style="display:none" onchange="fridaUpload(this)"></label>'
     +'<button class="btn" onclick="fridaSave(\''+esc(b)+'\')">保存</button>'
     +'<button class="btn" onclick="fridaLaunch(\''+esc(b)+'\')">保存并启动注入</button>'
+    +'<button class="btn" onclick="fridaDelete(\''+esc(b)+'\')">清空脚本</button>'
     +'<button class="btn" onclick="fridaClose()">关闭</button><span class="muted" id="fmsg"></span></div>'
     +'<div class="muted" style="margin-top:8px">启动注入 = frida spawn 该 App → resume → attach → 注入此 JS(需 frida-server + IOSDecryptHubFrida daemon)。</div>'
     +'<div class="fhdr" style="margin-top:10px">脚本日志 <span class="muted">console.log / send(每 1.5s 刷新)</span> <button class="btn" style="float:right" onclick="fridaClearLog(\''+esc(b)+'\')">清空日志</button></div><pre id="flog"></pre></div>';

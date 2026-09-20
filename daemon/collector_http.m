@@ -901,6 +901,14 @@ static void handleConn(int fd) {
             [[NSFileManager defaultManager] removeItemAtPath:@"/var/log/dh-frida.jsonl" error:nil];
             sendJSON(fd, @{@"ok": @YES}); return;
         }
+        // 清空脚本:删该 App 的 frida/<bundle>.js(之后 fridaJS=false,启动/重启不再注入)
+        if ([path isEqualToString:@"/api/frida/delete"]) {
+            if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+            [[NSFileManager defaultManager] removeItemAtPath:fridaJsPath(bundle) error:nil];
+            sendJSON(fd, @{@"ok": @YES}); return;
+        }
         if (!isGet) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"仅支持 GET" dataUsingEncoding:NSUTF8StringEncoding]); return; }
 
         if ([path isEqualToString:@"/"] || [path isEqualToString:@"/index.html"]) { sendHTML(fd, indexHTML()); return; }
