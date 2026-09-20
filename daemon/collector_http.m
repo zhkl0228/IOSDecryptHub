@@ -646,6 +646,14 @@ static BOOL validBundle(NSString *b) {
 static NSString *fridaJsPath(NSString *bundle) {
     return [DH_FRIDA_DIR stringByAppendingPathComponent:[bundle stringByAppendingString:@".js"]];
 }
+// 智能启动(冷启动场景用):配了 Frida JS 且 frida 可用 → 写请求让 dh_frida frida spawn+注入;否则 uiopen。
+// 保持前台的退出自启、restart-app 都用它,保证配了 JS 的 App「启动即带 frida」。仅用于进程不在时(冷启动);
+// App 在运行时(后台拉回)不能用——frida spawn 是冷启动会冲突,那种情况用 launchApp(uiopen)激活。
+static BOOL launchAppSmart(NSString *bundle) {
+    if (dh_frida_available() && [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)])
+        return [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    return launchApp(bundle);
+}
 // 读 HTTP 请求 body:handleConn 已把 header(可能连带部分 body)读进 buf,body 从 \r\n\r\n 后开始,按
 // Content-Length 续读到齐。用于保存 Frida JS 脚本(POST body 是脚本内容)。
 static NSData *readReqBody(int fd, const char *buf, size_t got) {
@@ -973,7 +981,7 @@ static void *fgKeepThread(void *arg) {
                 NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
                 if (pid == 0) {
                     aggLog([NSString stringWithFormat:@"[fg-keep] %@ 已退出,拉起", bundle]);
-                    dh_undim_screen(); launchApp(bundle); bgSince = 0;
+                    dh_undim_screen(); launchAppSmart(bundle); bgSince = 0;   // 配了 JS+frida 则 frida spawn 注入,否则 uiopen
                 } else {
                     int sc = dh_task_suspend_count(pid);
                     if (sc == 0) { bgSince = 0; }              // 前台/活跃
