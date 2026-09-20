@@ -694,6 +694,21 @@ int dh_proc_alive(const char *proc) {
     return pid;
 }
 
+// 查进程 task 的 suspend_count:>0=被系统挂起(App 转后台后被冻结),0=活跃(前台,或极少数有后台执行权的),
+// <0=拿不到(task_for_pid 失败/进程已退)。collector 有 task_for_pid entitlement,第三方 App 可读(实测)。
+// 前台判定 / 保持前台 / 前台 App 显示都用它——SBSCopyFrontmostApplicationDisplayIdentifier 在本机恒
+// 返回 null(该老 API 失效),suspend_count 是当前可靠的「App 是否在前台」信号。
+int dh_task_suspend_count(int pid) {
+    if (pid <= 0) return -1;
+    mach_port_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) return -1;
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t kr = task_info(task, MACH_TASK_BASIC_INFO, (task_info_t)&info, &cnt);
+    mach_port_deallocate(mach_task_self(), task);
+    return (kr == KERN_SUCCESS) ? (int)info.suspend_count : -1;
+}
+
 // 按可执行名 kickstart 重启 daemon(companion 随之重新注入)。domain/label 取自 DH_DAEMON_LIST 的
 // 硬编码常量(绝不用请求里的 proc 拼命令,只用它 strcmp 匹配白名单;命令参数全是编译期常量,无注入),
 // user 域用 uid 501(mobile);collector 是 root,能 kickstart user/501。返回 0 成功。

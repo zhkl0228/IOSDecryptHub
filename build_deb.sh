@@ -77,6 +77,10 @@ DAEMONS_HDR="$SCRIPT_DIR/src/dh_daemons.h"
 COMPANION_DYLIB="DHCompanion.dylib"
 COLLECTOR_BIN="IOSDecryptHubCollector"
 COLLECTOR_LABEL="com.iosdecrypthub.collector"
+# 自动解锁组件(注入 SpringBoard,仿 rp:锁屏时调 SBLockScreenManager unlockUIFromSource;设了 foregroundKeep 才动)
+DHUNLOCK_SRC="$SCRIPT_DIR/src/dh_unlock.m"
+DHUNLOCK_PLIST_SRC="$SCRIPT_DIR/src/DHUnlock.plist"
+DHUNLOCK_DYLIB="DHUnlock.dylib"
 
 compile_loader() {
     local ARCHS="$1"
@@ -167,6 +171,24 @@ compile_collector() {
         "$COLLECTOR_SRC" "$SCRIPT_DIR/daemon/collector_http.m" -o "$OUT"
 }
 
+compile_dhunlock() {
+    local ARCHS="$1"
+    local OUT="$2"
+    local ARCH_FLAGS=()
+    local ARCH
+    for ARCH in $ARCHS; do
+        ARCH_FLAGS+=( -arch "$ARCH" )
+    done
+    info "编译 DHUnlock (archs=$ARCHS)..."
+    mkdir -p "$(dirname "$OUT")"
+    # 注入 SpringBoard(arm64e 进程,需 arm64e 切片);只监听通知 + 调 SBLockScreenManager,不 hook。
+    $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
+        -dynamiclib -install_name /usr/lib/IOSDecryptHub/$DHUNLOCK_DYLIB \
+        -ObjC -fobjc-arc -Wall -O2 \
+        -framework Foundation -framework CoreFoundation \
+        "$DHUNLOCK_SRC" -o "$OUT"
+}
+
 # 由 dh_daemons.h 的 DH_DAEMON(exec,...) 单一来源生成 companion 的 Filter → Executables plist。
 gen_companion_filter() {
     local OUT="$1"
@@ -234,6 +256,7 @@ build_variant() {
     local COMPANION_OUT="$BUILD_DIR/_companion-${VARIANT}/$COMPANION_DYLIB"
     local COMPANION_FILTER_OUT="$BUILD_DIR/_companion-${VARIANT}/DHCompanion.plist"
     local COLLECTOR_OUT="$BUILD_DIR/_collector-${VARIANT}/$COLLECTOR_BIN"
+    local DHUNLOCK_OUT="$BUILD_DIR/_dhunlock-${VARIANT}/$DHUNLOCK_DYLIB"
     local ENGINE_DYLIB
 
     ENGINE_DYLIB=$(require_vendor_dylib "$ENGINE_VARIANT" "$MACHO_ARCHS")
@@ -244,6 +267,8 @@ build_variant() {
     compile_companion "$MACHO_ARCHS" "$COMPANION_OUT"
     compile_collector "arm64" "$COLLECTOR_OUT"
     gen_companion_filter "$COMPANION_FILTER_OUT"
+    # 自动解锁组件:注入 SpringBoard,需 arm64e 切片(SpringBoard 是 arm64e 进程)
+    compile_dhunlock "$MACHO_ARCHS" "$DHUNLOCK_OUT"
 
     info "打包 $VARIANT (arch=$ARCHITECTURE, prefix=${PREFIX:-/})..."
     rm -rf "$STAGE"
@@ -277,6 +302,9 @@ CTRL
     # 系统 daemon 注入(M1):companion(Filter=Executables,由 dh_daemons.h 生成)+ collector
     cp "$COMPANION_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     cp "$COMPANION_FILTER_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHCompanion.plist"
+    # 自动解锁组件(Filter Bundles=com.apple.springboard):设了 foregroundKeep 才在锁屏时自动解锁
+    cp "$DHUNLOCK_OUT" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$DHUNLOCK_DYLIB"
+    cp "$DHUNLOCK_PLIST_SRC" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHUnlock.plist"
     cp "$COLLECTOR_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
     # 引擎 WebUI 快照 + 聚合控制台 SPA:collector 托管(用 _NSGetExecutablePath 定位同目录)。
     cp "$SCRIPT_DIR/daemon/webui.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/webui.html"
@@ -497,6 +525,7 @@ POSTRM
     ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
+    ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$DHUNLOCK_DYLIB"
     ldid -S"$SCRIPT_DIR/daemon/collector_entitlements.plist" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
 
     cp -R "$STAGE/." "$PKG_STAGE/"

@@ -105,10 +105,20 @@ async function loadA(){
   _apps = a.apps || [];
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
-        '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span></div>'
+        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" onclick="unlockDev()">解锁/亮屏</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
+      + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" onclick="keepFg(\'\')">关闭保持前台</button></div>'
       + '<div id="atbl"></div>'
       + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
-      + '(App 引擎 WebUI 只在 App 前台时活、后台被 iOS 挂起,故不做「连活引擎」,从引擎悬浮窗看 ip:port 访问。)</div>';
+      + '(App 引擎 WebUI 只在 App 前台时活、后台被 iOS 挂起,故不做「连活引擎」,从引擎悬浮窗看 ip:port 访问。)<br>'
+      + '「保持前台」单选一个 App(独立于是否注入):它退出会自动拉起,转后台超过 1 分钟会被拉回前台(collector 用 suspend_count 判定 + uiopen,无注入面)。'
+      + '设了目标后,设备锁屏会自动解锁(需装 DHUnlock 组件;两者绑定,无单独开关)。</div>';
+  }
+  var fn=document.getElementById("fgnow"); if(fn) fn.textContent = (a.foreground&&a.foreground.length) ? a.foreground : "(无/未知)";
+  var sc=document.getElementById("scr");
+  if(sc){
+    var lk=a.locked, on=a.screenOn;   // lk: 1锁 0解 -1未知
+    var t = lk===1?"🔒 锁屏" : (lk===0?"🔓 已解锁" : (on?"亮屏":"息屏"));
+    sc.textContent = t + " · " + (on?"亮":"息") + (lk===-1?"(装 DHUnlock 显示锁屏态)":"");
   }
   renderA();
 }
@@ -117,21 +127,23 @@ function renderA(){
   var kw = (f ? f.value : "").trim().toLowerCase();
   var list = _apps.filter(function(x){ return !kw || (x.name+" "+x.bundle).toLowerCase().indexOf(kw)>=0; });
   document.getElementById("acnt").textContent = list.length+" 个";
-  var h = '<table><tr><th>App</th><th>PID</th><th>注入</th><th>运行</th><th>引擎</th><th>操作</th></tr>';
+  var h = '<table><tr><th>App</th><th>PID</th><th>保持前台</th><th>注入</th><th>运行</th><th>引擎</th><th>操作</th></tr>';
   list.forEach(function(x){
     var eng = !x.injected ? '<span class="off">—</span>'
             : '<span class="on">已注入</span> '+(x.version?esc(x.version):'')
               +' <a class="btn" href="http://'+H+':'+x.port+'/" target="_blank">连活引擎 :'+x.port+'</a>';
+    var run = x.running ? (x.foreground?'<span class="on">前台</span>':'<span class="off">后台</span>') : '<span class="off">未运行</span>';
     h += '<tr><td>'+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
       +  '<div class="muted">'+esc(x.bundle)+'</div></td>'
       +  '<td>'+pidCell(x.pid)+'</td>'
+      +  '<td style="text-align:center"><input type="radio" name="fgk" '+(x.keepFg?'checked':'')+' onchange="keepFg(\''+esc(x.bundle)+'\')"></td>'
       +  '<td><label class="sw"><input type="checkbox" '+(x.enabled?"checked":"")
       +      ' onchange="togA(\''+esc(x.bundle)+'\',this.checked)"><span class="sl"></span></label></td>'
-      +  '<td>'+(x.running?'<span class="on">运行中</span>':'<span class="off">未运行</span>')+'</td>'
+      +  '<td>'+run+'</td>'
       +  '<td>'+eng+'</td>'
       +  '<td>'+(x.running?'<button class="btn" onclick="rstA(\''+esc(x.bundle)+'\')">重启</button>':'<span class="muted">—</span>')+'</td></tr>';
   });
-  if(!list.length) h += '<tr><td class="muted" colspan="6">无匹配</td></tr>';
+  if(!list.length) h += '<tr><td class="muted" colspan="7">无匹配</td></tr>';
   h += '</table>';
   document.getElementById("atbl").innerHTML = h;
 }
@@ -145,6 +157,15 @@ async function rstA(b){
   var r = await post("/api/control/restart-app?bundle="+encodeURIComponent(b));
   toast(r.ok ? (b+" 已结束进程,重新打开即注入") : (r.note||"未在运行"), !r.ok);
   setTimeout(loadA, 1500);
+}
+async function keepFg(b){
+  var r = await post("/api/control/keep-fg"+(b?("?bundle="+encodeURIComponent(b)):""));
+  if(r.ok){ toast(b?("已设为保持前台:"+b):"已关闭保持前台"); loadA(); }
+  else toast("失败:"+(r.err||""), true);
+}
+async function unlockDev(){
+  var r = await post("/api/control/unlock");
+  toast(r.ok ? "已亮屏 + 发解锁通知(需装 DHUnlock 才真解锁)" : "失败", !r.ok);
 }
 
 loadA();

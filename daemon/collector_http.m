@@ -28,6 +28,8 @@
 #import <signal.h>        // kill(App 重启=结束进程)
 #import <spawn.h>         // posix_spawn(uiopen 启动 App)
 #import <sys/wait.h>      // waitpid
+#import <dlfcn.h>         // dlopen/dlsym(SBSUndimScreen 亮屏)
+#import <notify.h>        // notify_post(通知 SpringBoard 里的 DHUnlock 解锁)
 extern char **environ;
 
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
@@ -36,11 +38,15 @@ extern int  dh_proc_alive(const char *proc);                    // collector.c:�
 extern int  dh_restart_daemon(const char *proc);                // collector.c:kickstart 重启 daemon,0=成功
 extern const char *dh_daemons_json(void);                       // collector.c:白名单 [{proc,disp,domain}]
 extern int  dh_app_mem_read(int pid, uint32_t *port, char *bundle, size_t bcap, char *ver, size_t vcap);  // App vm_read 发现
+extern int  dh_task_suspend_count(int pid);                     // collector.c:task suspend_count,>0=后台挂起 0=前台 <0=拿不到
 
 // 注入门控 config(companion dh_enabled / collector mb_is_enabled 都读这份;与它们同路径)。
 #define DH_CFG_PATH @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
 #define DH_KEY_EXECS   @"enabledExecutables"   // 系统 daemon 注入名单(按 exec 名)
 #define DH_KEY_BUNDLES @"enabledBundles"        // App 注入名单(按 bundle id)
+#define DH_KEY_FGKEEP  @"foregroundKeep"        // 「保持前台」目标 bundle id(单值;空/缺=关闭);独立于注入名单
+// SpringBoard 里的 DHUnlock 读 foregroundKeep:非空即在锁屏时自动解锁(两者绑定,无单独开关)。
+#define DH_UNLOCK_NOTIFY  "com.iosdecrypthub.unlock"   // 手动解锁 darwin 通知(DHUnlock 监听)
 static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
 // 门控 config 读:key 下的数组是否含 val。key = DH_KEY_EXECS(daemon)/ DH_KEY_BUNDLES(App)。
 static BOOL cfgHasMember(NSString *key, NSString *val) {
@@ -60,6 +66,44 @@ static BOOL cfgSetMember(NSString *key, NSString *val, BOOL on) {
     else if (!on && has) [a removeObject:val];
     d[key] = a;
     return [d writeToFile:DH_CFG_PATH atomically:YES];
+}
+// 单值(字符串)config 读写:用于 foregroundKeep(单个 bundle)。读改写保留其它 key(同 cfgSetMember 顾虑)。
+static NSString *cfgGetScalar(NSString *key) {
+    id v = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
+    return [v isKindOfClass:[NSString class]] ? v : @"";
+}
+static BOOL cfgSetScalar(NSString *key, NSString *val) {
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH] mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (val.length) d[key] = val; else [d removeObjectForKey:key];   // 空=清除(关闭保持前台)
+    return [d writeToFile:DH_CFG_PATH atomically:YES];
+}
+
+// 亮屏:惰性 dlopen SpringBoardServices 的 SBSUndimScreen(实测 collector root 可调)。无密码设备上 uiopen
+// 一个 App 会把屏点亮并越过锁屏进该 App(实测 suspend_count 1→0);此函数单独用于「解锁/亮屏」按钮。
+static void dh_undim_screen(void) {
+    static void (*undim)(void); static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+        if (h) undim = (void (*)(void))dlsym(h, "SBSUndimScreen");
+    });
+    if (undim) undim();
+}
+
+// 屏幕亮度(BackBoardServices,惰性 dlopen):>0=亮屏,0=息屏,<0=拿不到。用于 web 显示屏幕开关。
+static float dh_screen_brightness(void) {
+    static float (*bget)(void); static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+        if (h) bget = (float (*)(void))dlsym(h, "BKSDisplayBrightnessGetCurrent");
+    });
+    return bget ? bget() : -1.0f;
+}
+// 锁屏状态:读 DHUnlock 写的 /var/jb/tmp/dh_lockstate("1"锁/"0"解);无文件(没装 DHUnlock)返回 -1=未知。
+// collector 读不到 SpringBoard 的 SBLockScreenManager,精确锁屏态由 SpringBoard 里的 DHUnlock 落文件转达。
+static int dh_screen_locked(void) {
+    NSString *s = [NSString stringWithContentsOfFile:@"/var/jb/tmp/dh_lockstate" encoding:NSUTF8StringEncoding error:nil];
+    if (!s.length) return -1;
+    return [s hasPrefix:@"1"] ? 1 : 0;
 }
 
 // daemon 三态:live=引擎就绪可连活引擎 / idle=进程在但没注入引擎(未启用) / dead=进程已退出仅历史。
@@ -517,20 +561,33 @@ static NSDictionary *appInjectMap(void) {
 static NSDictionary *controlAppData(void) {
     NSSet *en = [NSSet setWithArray:cfgMembers(DH_KEY_BUNDLES)];
     NSDictionary *ports = appInjectMap();
+    NSString *fgKeep = cfgGetScalar(DH_KEY_FGKEEP);   // 当前「保持前台」目标(单值)
     NSMutableArray *out = [NSMutableArray array];
+    NSMutableArray *fgNames = [NSMutableArray array]; // 当前前台 App(suspend_count==0)的名字,给控制台显示
     for (NSDictionary *a in enumApps()) {
         NSString *bundle = a[@"bundle"], *exec = a[@"exec"];
         int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
+        // 前台判定:running 才查 suspend_count(task_for_pid 一次);0=前台/活跃,>0=后台被挂起,<0=拿不到。
+        int sc = pid ? dh_task_suspend_count(pid) : -1;
+        BOOL foreground = (pid != 0 && sc == 0);
+        if (foreground) [fgNames addObject:a[@"name"]];
         NSArray *pe = ports[bundle];   // @[port, ver] 或 nil(未注入)
         BOOL injected = pe != nil;
         [out addObject:@{ @"bundle": bundle, @"name": a[@"name"], @"system": a[@"system"],
                           @"enabled": @([en containsObject:bundle]),
                           @"running": @(pid != 0), @"pid": @(pid),
+                          @"suspend": @(sc), @"foreground": @(foreground),
+                          @"keepFg": @([bundle isEqualToString:fgKeep]),
                           @"injected": @(injected),
                           @"port": injected ? pe[0] : @0,
                           @"version": injected ? ([pe[1] length] ? pe[1] : @ENGINE_VER) : @"" }];
     }
-    return @{ @"apps": out, @"engineVer": @ENGINE_VER };
+    float bright = dh_screen_brightness();
+    return @{ @"apps": out, @"engineVer": @ENGINE_VER,
+              @"fgKeep": fgKeep ?: @"",
+              @"foreground": [fgNames componentsJoinedByString:@" / "],
+              @"screenOn": @(bright > 0.0f),        // 亮屏/息屏(collector 直接读亮度)
+              @"locked": @(dh_screen_locked()) };   // 1=锁屏 0=已解锁 -1=未知(没装 DHUnlock)
 }
 // App 重启=结束进程(iOS App 非 launchd KeepAlive,kill 后由用户/系统重新打开时带上新注入)。按枚举到的
 // CFBundleExecutable 找 pid kill;只对枚举到的 App(不接受任意名),bundle 必须在 App 列表里。返回是否 kill。
@@ -591,6 +648,26 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         sendJSON(fd, @{@"ok": @(launched), @"killed": @(killed), @"launched": @(launched),
                        @"note": launched ? @"已重启(引擎随之注入)" : (killed ? @"已结束但启动失败(daemon 拉起 App 权限不足?手动打开)" : @"未在运行,尝试启动失败") });
         return;
+    }
+    // 保持前台:单值目标(bundle 空=关闭)。独立于注入名单;监控线程按 suspend_count 判定 + uiopen 拉前台。
+    if ([action isEqualToString:@"keep-fg"]) {
+        NSString *bundle = [q[@"bundle"] isKindOfClass:[NSString class]] ? q[@"bundle"] : @"";
+        if (bundle.length) {
+            NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:
+                @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"];
+            if (bundle.length > 128 || [[bundle stringByTrimmingCharactersInSet:ok] length]) {
+                sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle id"}); return; }
+        }
+        BOOL w = cfgSetScalar(DH_KEY_FGKEEP, bundle);   // 空=清除(关闭保持前台)
+        if (w && bundle.length) { dh_undim_screen(); launchApp(bundle); }   // 设了目标即立刻亮屏拉前台一次
+        sendJSON(fd, @{@"ok": @(w), @"fgKeep": cfgGetScalar(DH_KEY_FGKEEP)}); return;
+    }
+    // 解锁:亮屏(SBSUndimScreen)+ 发 darwin 通知让 SpringBoard 里的 DHUnlock 调 unlockUIFromSource:0。
+    // 真正 dismiss 锁屏必须在 SpringBoard 进程内(实测外部只能亮屏);DHUnlock 没装则只亮屏。
+    if ([action isEqualToString:@"unlock"]) {
+        dh_undim_screen();
+        notify_post(DH_UNLOCK_NOTIFY);
+        sendJSON(fd, @{@"ok": @YES, @"undim": @YES, @"notified": @YES}); return;
     }
     send404(fd);
 }
@@ -762,7 +839,51 @@ static void *aggThread(void *arg) {
     return NULL;
 }
 
+// 「保持前台」监控:每 ~12s 检查 foregroundKeep 目标——进程退了就拉起(退出自启),被系统挂起(后台)
+// 持续 ≥60s 就 uiopen 拉回前台。全用 collector 现成能力(dh_proc_alive / dh_task_suspend_count /
+// launchApp / dh_undim_screen),零注入面。目标由 web 单选,独立于是否注入引擎。
+static NSString *fgExecForBundle(NSString *bundle) {
+    for (NSDictionary *a in enumApps()) if ([a[@"bundle"] isEqualToString:bundle]) return a[@"exec"];
+    return @"";
+}
+static void *fgKeepThread(void *arg) {
+    (void)arg;
+    NSString *lastBundle = @"";
+    NSTimeInterval bgSince = 0;            // 首次发现目标被挂起的时刻;0=当前在前台/无目标
+    const NSTimeInterval kBgLimit = 60;    // 被挂起(后台)超过这么久就拉回前台
+    for (;;) {
+        @autoreleasepool {
+            NSString *bundle = cfgGetScalar(DH_KEY_FGKEEP);
+            if (![bundle isEqualToString:lastBundle]) { lastBundle = bundle; bgSince = 0; }   // 目标切换,重置计时
+            if (bundle.length) {
+                NSString *exec = fgExecForBundle(bundle);
+                int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
+                NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+                if (pid == 0) {
+                    aggLog([NSString stringWithFormat:@"[fg-keep] %@ 已退出,拉起", bundle]);
+                    dh_undim_screen(); launchApp(bundle); bgSince = 0;
+                } else {
+                    int sc = dh_task_suspend_count(pid);
+                    if (sc == 0) { bgSince = 0; }              // 前台/活跃
+                    else if (sc > 0) {                          // 被系统挂起=在后台
+                        if (bgSince == 0) bgSince = now;
+                        else if (now - bgSince >= kBgLimit) {
+                            aggLog([NSString stringWithFormat:@"[fg-keep] %@ 后台 %.0fs,拉回前台", bundle, now - bgSince]);
+                            dh_undim_screen(); launchApp(bundle); bgSince = 0;
+                        }
+                    }
+                    // sc<0:task_for_pid 失败(进程正退/受保护),不动,下轮 dh_proc_alive 反映
+                }
+            }
+        }
+        sleep(12);
+    }
+    return NULL;
+}
+
 void dh_agg_http_start(void) {
     pthread_t th;
     if (pthread_create(&th, NULL, aggThread, NULL) == 0) pthread_detach(th);
+    pthread_t fg;
+    if (pthread_create(&fg, NULL, fgKeepThread, NULL) == 0) pthread_detach(fg);   // 保持前台监控
 }
