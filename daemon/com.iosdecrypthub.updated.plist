@@ -12,6 +12,8 @@
     <array>
         <string>/var/mobile/Library/Preferences/com.iosdecrypthub.updater.request.plist</string>
         <string>/var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist</string>
+        <string>/var/mobile/Library/Caches/com.iosdecrypthub/updater.request.plist</string>
+        <string>@PREFIX@/usr/lib/IOSDecryptHub/config/updater.request.plist</string>
     </array>
     <key>StartInterval</key>
     <integer>43200</integer>

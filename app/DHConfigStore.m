@@ -62,6 +62,14 @@ static NSString *_Nullable dh_config_path(void) {
     return paths.firstObject;
 }
 
+// roothide: 绝对 /var/mobile 会被容器重定向；NSHomeDirectory() 才是 App 与
+// daemon 共享的真实 /var/mobile。loader prefs 也必须走这个路径，否则 daemon
+// 读不到 App 写入的 updaterRequest。
+static NSString *dh_loader_prefs_path(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Preferences/com.iosdecrypthub.loader.plist"];
+}
+
 static NSSet<NSString *> *_Nullable dh_bundles_from_dict(NSDictionary *domain) {
     id value = domain[DH_KEY_BUNDLES];
     if ([value isKindOfClass:[NSArray class]]) return [NSSet setWithArray:value];
@@ -70,6 +78,10 @@ static NSSet<NSString *> *_Nullable dh_bundles_from_dict(NSDictionary *domain) {
 
 NSSet<NSString *> *DHReadEnabledBundles(void) {
     @try {
+        NSSet *fromHome = dh_bundles_from_dict(
+            [NSDictionary dictionaryWithContentsOfFile:dh_loader_prefs_path()]);
+        if (fromHome) return fromHome;
+
         NSSet *fromPrefs = dh_bundles_from_dict(
             [NSDictionary dictionaryWithContentsOfFile:DH_LOADER_PREFS]);
         if (fromPrefs) return fromPrefs;
@@ -133,23 +145,73 @@ static BOOL dh_write_jb_config_key(NSString *key, NSArray<NSString *> *values) {
 // 读改写 loader prefs 的一个 key(保留其他 key)。prefs 是 App 权威副本,且 rootHide 下
 // updated.sh 用 `cp prefs → jb config` 同步——所以 prefs 必须同时含 enabledBundles 与
 // enabledExecutables,否则那次 cp 会把另一个抹掉。写失败经 outError 上报。
+// 路径走 dh_loader_prefs_path()(NSHomeDirectory 拼接)而非硬编码 DH_LOADER_PREFS:
+// roothide 下 App 的绝对 /var/mobile 会被容器重定向,daemon 读不到——见上游 3471b39。
 static BOOL dh_write_prefs_key(NSString *key, NSArray<NSString *> *values, NSError **outError) {
-    NSMutableDictionary *prefs = [[NSDictionary dictionaryWithContentsOfFile:DH_LOADER_PREFS] mutableCopy];
+    NSString *loaderPath = dh_loader_prefs_path();
+    NSMutableDictionary *prefs = [[NSDictionary dictionaryWithContentsOfFile:loaderPath] mutableCopy];
     if (![prefs isKindOfClass:[NSMutableDictionary class]]) prefs = [NSMutableDictionary dictionary];
     prefs[key] = values ?: @[];
     NSError *error = nil;
     NSData *data = [NSPropertyListSerialization dataWithPropertyList:prefs
         format:NSPropertyListXMLFormat_v1_0 options:0 error:&error];
     if (!data) { if (outError) *outError = error; return NO; }
-    if (![data writeToFile:DH_LOADER_PREFS options:NSDataWritingAtomic error:&error]) {
+    if (![data writeToFile:loaderPath options:NSDataWritingAtomic error:&error]) {
         if (outError) *outError = error;
         return NO;
     }
     [[NSFileManager defaultManager] setAttributes:@{
         NSFilePosixPermissions: @0644,
         NSFileProtectionKey: NSFileProtectionNone,
-    } ofItemAtPath:DH_LOADER_PREFS error:nil];
+    } ofItemAtPath:loaderPath error:nil];
     return YES;
+}
+
+// 更新请求多路投递。roothide 下 App 的绝对 /var/mobile 会被容器重定向，
+// 必须用 NSHomeDirectory() 拼接才能落到 daemon 能读到的真实路径；同时把请求
+// 挂到 loader prefs 的 updaterRequest 键，借用 daemon 已监听的通道触发。
+static BOOL dh_write_request_dict(NSDictionary *req) {
+    BOOL ok = NO;
+    NSString *home = NSHomeDirectory();
+    NSArray<NSString *> *paths = @[
+        [home stringByAppendingPathComponent:@"Library/Preferences/com.iosdecrypthub.updater.request.plist"],
+        [home stringByAppendingPathComponent:@"Library/Caches/com.iosdecrypthub/updater.request.plist"],
+        DH_REQUEST_PATH,
+        DH_REQUEST_CACHE_PATH,
+    ];
+    for (NSString *path in paths) {
+        @try {
+            NSString *dir = [path stringByDeletingLastPathComponent];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                withIntermediateDirectories:YES
+                                 attributes:@{ NSFilePosixPermissions: @0777 }
+                                      error:nil];
+            if ([req writeToFile:path atomically:YES]) {
+                ok = YES;
+                [[NSFileManager defaultManager] setAttributes:@{
+                    NSFilePosixPermissions: @0666,
+                    NSFileProtectionKey: NSFileProtectionNone,
+                } ofItemAtPath:path error:nil];
+            }
+        } @catch (__unused NSException *e) {
+        }
+    }
+    @try {
+        NSString *loaderPath = dh_loader_prefs_path();
+        NSMutableDictionary *prefs =
+            [[NSDictionary dictionaryWithContentsOfFile:loaderPath] mutableCopy]
+                ?: [NSMutableDictionary dictionary];
+        prefs[@"updaterRequest"] = req;
+        if ([prefs writeToFile:loaderPath atomically:YES]) {
+            ok = YES;
+            [[NSFileManager defaultManager] setAttributes:@{
+                NSFilePosixPermissions: @0644,
+                NSFileProtectionKey: NSFileProtectionNone,
+            } ofItemAtPath:loaderPath error:nil];
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return ok;
 }
 
 static void dh_request_set_enabled(NSArray<NSString *> *values) {
@@ -158,20 +220,13 @@ static void dh_request_set_enabled(NSArray<NSString *> *values) {
         DH_KEY_BUNDLES: values ?: @[],
         @"time": @([[NSDate date] timeIntervalSince1970]),
     };
-    @try {
-        [req writeToFile:DH_REQUEST_PATH atomically:YES];
-        [[NSFileManager defaultManager] setAttributes:@{
-            NSFilePosixPermissions: @0644,
-            NSFileProtectionKey: NSFileProtectionNone,
-        } ofItemAtPath:DH_REQUEST_PATH error:nil];
-    } @catch (__unused NSException *e) {
-    }
+    (void)dh_write_request_dict(req);
 }
 
 BOOL DHWriteEnabledBundles(NSSet<NSString *> *bundleIDs, NSError **outError) {
     NSArray *values = [[bundleIDs allObjects] sortedArrayUsingSelector:@selector(compare:)];
     @try {
-        // prefs 是权威副本:读改写(保留 enabledExecutables),写失败即整体失败。
+        // prefs 是权威副本:读改写(保留 updaterRequest / enabledExecutables 等其它键),写失败即整体失败。
         if (!dh_write_prefs_key(DH_KEY_BUNDLES, values, outError)) return NO;
         dh_sync_cfprefs(values);
         // 读改写 jb 配置(保留 enabledExecutables),而非整份覆写。
@@ -210,12 +265,14 @@ static BOOL dh_request_set_execs(NSArray<NSString *> *values) {
 
 NSSet<NSString *> *DHReadEnabledExecutables(void) {
     @try {
-        // prefs 权威优先(与 enabledBundles 一致),回退 jb 配置(companion 读那份)。
-        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:DH_LOADER_PREFS];
-        id value = prefs[DH_KEY_EXECS];
+        // prefs 权威优先(与 enabledBundles 一致):先读 home 路径(dh_write_prefs_key 写到这),
+        // 再回退硬编码 /var/mobile(兼容旧写入),最后回退 jb 配置(companion 读那份)。
+        // roothide 下 App 绝对 /var/mobile 会被容器重定向,故 home 优先——见上游 3471b39。
+        id value = [NSDictionary dictionaryWithContentsOfFile:dh_loader_prefs_path()][DH_KEY_EXECS];
         if ([value isKindOfClass:[NSArray class]]) return [NSSet setWithArray:value];
-        NSDictionary *jb = [NSDictionary dictionaryWithContentsOfFile:dh_config_path()];
-        value = jb[DH_KEY_EXECS];
+        value = [NSDictionary dictionaryWithContentsOfFile:DH_LOADER_PREFS][DH_KEY_EXECS];
+        if ([value isKindOfClass:[NSArray class]]) return [NSSet setWithArray:value];
+        value = [NSDictionary dictionaryWithContentsOfFile:dh_config_path()][DH_KEY_EXECS];
         if ([value isKindOfClass:[NSArray class]]) return [NSSet setWithArray:value];
     } @catch (__unused NSException *e) {
     }
@@ -367,11 +424,7 @@ BOOL DHWriteUpdateRequest(NSString *action, NSString *_Nullable version) {
     request[@"time"] = @([[NSDate date] timeIntervalSince1970]);
     if (version.length) request[@"version"] = version;   // 指定版本安装（历史版本）
     NSDictionary *req = request;
-    @try {
-        return [req writeToFile:DH_REQUEST_PATH atomically:YES];
-    } @catch (__unused NSException *e) {
-        return NO;
-    }
+    return dh_write_request_dict(req);
 }
 
 static NSString *dh_strip_v(NSString *s) {
@@ -414,36 +467,206 @@ static NSError *dh_net_error(NSError *error) {
                            userInfo:@{NSLocalizedDescriptionKey: text}];
 }
 
-void DHFetchLatestRelease(void (^completion)(NSDictionary *_Nullable, NSError *_Nullable)) {
-    NSURL *url = [NSURL URLWithString:DH_GITHUB_LATEST];
+#pragma mark - 最新版本：优先 releases/latest 302，API 只兜底
+
+// GitHub API 未认证配额是 60 次/小时/IP，共享出口/VPN 很容易 403；管理器 App
+// 之前只走 API，失败时用户看到的就是"没网"。releases/latest 的 302 不吃配额，
+// 与 daemon 的主路径保持一致。
+@interface DHAppRedirectProbe : NSObject <NSURLSessionTaskDelegate>
+@property (nonatomic, copy, nullable) NSString *location;
+@property (nonatomic, copy, nullable) void (^onRedirect)(void);
+@end
+
+@implementation DHAppRedirectProbe
+
+- (void)URLSession:(__unused NSURLSession *)session
+              task:(__unused NSURLSessionTask *)task
+willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+        newRequest:(NSURLRequest *)request
+ completionHandler:(void (^)(NSURLRequest *_Nullable))completionHandler {
+    id location = response.allHeaderFields[@"Location"];
+    self.location = [location isKindOfClass:[NSString class]]
+        ? location : request.URL.absoluteString;
+    completionHandler(nil);
+    if (self.onRedirect) self.onRedirect();
+}
+
+@end
+
+// 从 .../releases/tag/v1.27.5 解析 tag；形状不对返回 nil。
+static NSString *_Nullable dh_tag_from_location(NSString *_Nullable location) {
+    if (![location isKindOfClass:[NSString class]] || location.length == 0) return nil;
+    NSString *tag = [NSURL URLWithString:location].lastPathComponent;
+    if (tag.length == 0) return nil;
+    NSString *body = ([tag hasPrefix:@"v"] || [tag hasPrefix:@"V"])
+        ? [tag substringFromIndex:1] : tag;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];
+    if (body.length == 0) return nil;
+    if ([body rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound) return nil;
+    if ([body rangeOfString:@"."].location == NSNotFound) return nil;
+    return tag;
+}
+
+static void dh_fetch_latest_via_redirect(void (^completion)(NSDictionary *_Nullable, NSError *_Nullable)) {
+    NSURL *url = [NSURL URLWithString:DH_RELEASE_LATEST];
     if (!url) {
-        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil,
-            [NSError errorWithDomain:@"DHManager" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"更新地址无效"}]); });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, [NSError errorWithDomain:@"DHManager" code:-10 userInfo:
+                @{NSLocalizedDescriptionKey: @"releases/latest 地址无效"}]);
+        });
         return;
     }
-    NSURLSession *session = dh_shared_session();
-    [[session dataTaskWithURL:url completionHandler:^(NSData *_Nullable data,
-        __unused NSURLResponse *_Nullable response, NSError *_Nullable error) {
-        NSDictionary *info = nil;
-        NSError *err = dh_net_error(error);
-        if (!err) {
-            @try {
-                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data
-                    options:0 error:&err];
-                NSString *tag = json[@"tag_name"];
-                if (!err && [tag isKindOfClass:[NSString class]] && tag.length) {
-                    info = @{@"tag": tag, @"version": dh_strip_v(tag)};
-                } else if (!err) {
-                    err = [NSError errorWithDomain:@"DHManager" code:-2 userInfo:
-                        @{NSLocalizedDescriptionKey: @" release 信息缺失 tag_name"}];
-                }
-            } @catch (__unused NSException *e) {
-                err = [NSError errorWithDomain:@"DHManager" code:-3 userInfo:
-                    @{NSLocalizedDescriptionKey: @"release 信息解析失败"}];
-            }
-        }
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    cfg.timeoutIntervalForRequest = 20;
+    cfg.timeoutIntervalForResource = 30;
+    DHAppRedirectProbe *probe = [[DHAppRedirectProbe alloc] init];
+    __weak DHAppRedirectProbe *weakProbe = probe;
+    __block BOOL finished = NO;
+    __block NSURLSession *session = nil;
+    void (^finish)(NSDictionary *, NSError *) = ^(NSDictionary *info, NSError *err) {
+        if (finished) return;
+        finished = YES;
+        [session invalidateAndCancel];
         dispatch_async(dispatch_get_main_queue(), ^{ completion(info, err); });
+    };
+    probe.onRedirect = ^{
+        NSString *tag = dh_tag_from_location(weakProbe.location);
+        if (tag.length) {
+            finish(@{@"tag": tag, @"version": dh_strip_v(tag)}, nil);
+        } else {
+            finish(nil, [NSError errorWithDomain:@"DHManager" code:-11 userInfo:
+                @{NSLocalizedDescriptionKey: @"GitHub 重定向里没有可解析的版本号"}]);
+        }
+    };
+    session = [NSURLSession sessionWithConfiguration:cfg
+                                            delegate:probe
+                                       delegateQueue:nil];
+    [[session dataTaskWithURL:url completionHandler:^(__unused NSData *data,
+        NSURLResponse *_Nullable response, NSError *_Nullable error) {
+        if (finished) return;
+        if (error) {
+            finish(nil, dh_net_error(error));
+            return;
+        }
+        NSString *tag = dh_tag_from_location(response.URL.absoluteString);
+        if (tag.length) {
+            finish(@{@"tag": tag, @"version": dh_strip_v(tag)}, nil);
+        } else {
+            finish(nil, [NSError errorWithDomain:@"DHManager" code:-12 userInfo:
+                @{NSLocalizedDescriptionKey: @"GitHub releases/latest 未返回版本号"}]);
+        }
     }] resume];
+}
+
+static void dh_fetch_latest_direct(void (^completion)(NSDictionary *_Nullable, NSError *_Nullable)) {
+    dh_fetch_latest_via_redirect(^(NSDictionary *_Nullable info, NSError *_Nullable redirectError) {
+        if (info) {
+            completion(info, nil);
+            return;
+        }
+        // 兜底：API 能拿到资产列表，容忍引擎改名，但可能受未认证配额限制。
+        NSURL *url = [NSURL URLWithString:DH_GITHUB_LATEST];
+        if (!url) {
+            completion(nil, redirectError);
+            return;
+        }
+        NSURLSession *session = dh_shared_session();
+        [[session dataTaskWithURL:url completionHandler:^(NSData *_Nullable data,
+            NSURLResponse *_Nullable response, NSError *_Nullable error) {
+            NSDictionary *apiInfo = nil;
+            NSError *err = dh_net_error(error);
+            if (!err) {
+                NSInteger code = [response isKindOfClass:[NSHTTPURLResponse class]]
+                    ? [(NSHTTPURLResponse *)response statusCode] : 0;
+                if (code >= 400) {
+                    err = [NSError errorWithDomain:@"DHManager" code:code userInfo:
+                        @{NSLocalizedDescriptionKey: [NSString stringWithFormat:
+                            @"GitHub API HTTP %ld（未认证配额可能已用尽）", (long)code]}];
+                }
+            }
+            if (!err) {
+                @try {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data
+                        options:0 error:&err];
+                    NSString *tag = json[@"tag_name"];
+                    if (!err && [tag isKindOfClass:[NSString class]] && tag.length) {
+                        apiInfo = @{@"tag": tag, @"version": dh_strip_v(tag)};
+                    } else if (!err) {
+                        err = [NSError errorWithDomain:@"DHManager" code:-2 userInfo:
+                            @{NSLocalizedDescriptionKey: @"release 信息缺失 tag_name"}];
+                    }
+                } @catch (__unused NSException *e) {
+                    err = [NSError errorWithDomain:@"DHManager" code:-3 userInfo:
+                        @{NSLocalizedDescriptionKey: @"release 信息解析失败"}];
+                }
+            }
+            if (!apiInfo && redirectError && err) {
+                NSString *text = [NSString stringWithFormat:@"%@；API 兜底：%@",
+                    redirectError.localizedDescription, err.localizedDescription];
+                err = [NSError errorWithDomain:err.domain code:err.code
+                                       userInfo:@{NSLocalizedDescriptionKey: text}];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(apiInfo, apiInfo ? nil : err);
+            });
+        }] resume];
+    });
+}
+
+// App 本身在部分越狱环境（roothide 实测）会被网络策略拒绝，NSURLSession 直接返回
+// -1020 DataNotAllowed；updater daemon 以 root 运行，网络始终可用。因此更新检查
+// 优先让 daemon 做，App 只写请求 + 轮询 state。daemon 不可用时才回退直连。
+static void dh_fetch_latest_from_daemon(void (^completion)(NSDictionary *_Nullable, NSError *_Nullable)) {
+    NSTimeInterval requestTime = [[NSDate date] timeIntervalSince1970];
+    if (!DHWriteUpdateRequest(DH_REQ_CHECK, nil)) {
+        dh_fetch_latest_direct(completion);
+        return;
+    }
+    __block NSInteger attempts = 0;
+    __block BOOL retried = NO;
+    __block BOOL finished = NO;
+    __block void (^poll)(void) = nil;
+    poll = ^{
+        if (finished) { poll = nil; return; }
+        attempts++;
+        NSDictionary *state = DHReadUpdaterState();
+        NSTimeInterval lastCheck = [state[@"lastCheck"] doubleValue];
+        if (lastCheck >= requestTime - 0.5) {
+            finished = YES;
+            poll = nil;   // 断开递归 block 的自引用
+            id latest = state[@"latestVersion"];
+            id errText = state[@"lastCheckError"];
+            if ([latest isKindOfClass:[NSString class]] && [latest length] > 0) {
+                completion(@{@"tag": latest, @"version": dh_strip_v(latest)}, nil);
+            } else if ([errText isKindOfClass:[NSString class]] && [errText length] > 0) {
+                completion(nil, [NSError errorWithDomain:@"DHManager" code:-20 userInfo:
+                    @{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"后台更新服务：%@", errText]}]);
+            } else {
+                completion(nil, [NSError errorWithDomain:@"DHManager" code:-21 userInfo:
+                    @{NSLocalizedDescriptionKey: @"后台更新服务没有返回版本信息"}]);
+            }
+            return;
+        }
+        // daemon 可能被周期任务占用或 WatchPaths 合并触发；5 秒后补写一次请求。
+        if (!retried && attempts >= 12) {
+            retried = YES;
+            DHWriteUpdateRequest(DH_REQ_CHECK, nil);
+        }
+        if (attempts >= 100) {   // 40 秒
+            finished = YES;
+            poll = nil;
+            dh_fetch_latest_direct(completion);
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), poll);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), poll);
+}
+
+void DHFetchLatestRelease(void (^completion)(NSDictionary *_Nullable, NSError *_Nullable)) {
+    dh_fetch_latest_from_daemon(completion);
 }
 
 BOOL DHWriteRestartRequest(NSString *bundleID) {
@@ -453,11 +676,7 @@ BOOL DHWriteRestartRequest(NSString *bundleID) {
         @"bundle": bundleID,
         @"time": @([[NSDate date] timeIntervalSince1970]),
     };
-    @try {
-        return [req writeToFile:DH_REQUEST_PATH atomically:YES];
-    } @catch (__unused NSException *e) {
-        return NO;
-    }
+    return dh_write_request_dict(req);
 }
 
 NSString *_Nullable DHPendingUpdateVersion(void) {
@@ -481,11 +700,7 @@ BOOL DHWriteStopRequest(NSString *bundleID) {
         @"bundle": bundleID,
         @"time": @([[NSDate date] timeIntervalSince1970]),
     };
-    @try {
-        return [req writeToFile:DH_REQUEST_PATH atomically:YES];
-    } @catch (__unused NSException *e) {
-        return NO;
-    }
+    return dh_write_request_dict(req);
 }
 
 #pragma mark - 历史版本

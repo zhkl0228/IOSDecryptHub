@@ -39,6 +39,12 @@
 #define DH_STATE_FILE     @"state.plist"
 
 #define DH_REQUEST_PATH   @"/var/mobile/Library/Preferences/com.iosdecrypthub.updater.request.plist"
+// roothide 下 App 对 /var/mobile 的原子写可能被容器映射/权限挡住；jb config 是
+// App 一定可写的路径。App 双写，updated.sh 在启动 daemon 前把它转交到 DH_REQUEST_PATH。
+#define DH_REQUEST_JB_REL @"usr/lib/IOSDecryptHub/config/updater.request.plist"
+// App 自己的共享缓存目录（postinst 已 chown mobile + 0777），是 roothide 下
+// 最可靠的请求投递点；launchd 监听它，updated.sh 转交到 DH_REQUEST_PATH。
+#define DH_REQUEST_CACHE_PATH @"/var/mobile/Library/Caches/com.iosdecrypthub/updater.request.plist"
 #define DH_LOADER_PREFS   @"/var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist"
 #define DH_STATE_PATH     @"/var/mobile/Library/Preferences/com.iosdecrypthub.updater.state.plist"
 #define DH_LOCK_PATH      @"/var/mobile/Library/Preferences/com.iosdecrypthub.updated.lock"

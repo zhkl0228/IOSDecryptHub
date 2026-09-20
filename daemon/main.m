@@ -158,6 +158,35 @@ static NSString *_Nullable dh_existing_engine_dir(void) {
     return readable;
 }
 
+// 引擎 dylib 缺失时 dh_existing_engine_dir 会返回 nil，但目录本身可能还在。
+// 这种情况仍要能写 state，让 App 看到“引擎不存在”的错误，而不是静默退出。
+static NSString *_Nullable dh_existing_engine_dir_loose(void) {
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    [dirs addObject:@"/usr/lib/IOSDecryptHub"];
+    [dirs addObject:@"/var/jb/usr/lib/IOSDecryptHub"];
+    NSString *root = dh_bootstrap_root();
+    if (root.length) {
+        char resolved[PATH_MAX];
+        if (realpath(root.fileSystemRepresentation, resolved)) {
+            NSString *real = [NSString stringWithUTF8String:resolved];
+            if (real.length && ![real isEqualToString:@"/"]) {
+                [dirs addObject:[real stringByAppendingPathComponent:@"usr/lib/IOSDecryptHub"]];
+            }
+        }
+        if (![root isEqualToString:@"/"]) {
+            [dirs addObject:[root stringByAppendingPathComponent:@"usr/lib/IOSDecryptHub"]];
+        }
+    }
+    for (NSString *dir in dirs) {
+        int fd = open(dir.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            close(fd);
+            return dir;
+        }
+    }
+    return nil;
+}
+
 #pragma mark - 单实例锁
 
 // launchd 的 WatchPaths 与 StartInterval 可能叠在一起触发。并发改写引擎 =
@@ -990,13 +1019,37 @@ static void dh_process_request(void) {
     dh_ensure_request_file();
     NSMutableDictionary *req = [(dh_read_plist(DH_REQUEST_PATH) ?: @{}) mutableCopy];
     NSString *action = req[@"action"];
+    BOOL fromLoaderPrefs = NO;
+    if (![action isKindOfClass:[NSString class]] || [action isEqualToString:DH_REQ_NONE]) {
+        // roothide: App 的 /var/mobile 写入可能落在容器视图，request 文件到不了
+        // daemon。loader prefs 是 App 与 daemon 都稳定使用的通道，这里兜底读取。
+        NSString *loaderPath = dh_jb_path(@"var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist");
+        if (!loaderPath.length) loaderPath = DH_LOADER_PREFS;
+        NSDictionary *loader = dh_read_plist(loaderPath) ?: dh_read_plist(DH_LOADER_PREFS);
+        NSDictionary *pending = loader[@"updaterRequest"];
+        if ([pending isKindOfClass:[NSDictionary class]]) {
+            req = [pending mutableCopy];
+            action = req[@"action"];
+            fromLoaderPrefs = YES;
+        }
+    }
     if (![action isKindOfClass:[NSString class]] || [action isEqualToString:DH_REQ_NONE]) {
         return;
     }
     // 先清零再执行：本次写入会再次触发 WatchPaths，但下次进来 action=none 直接返回，不会循环
     req[@"action"] = DH_REQ_NONE;
-    dh_write_plist(req, DH_REQUEST_PATH);
-    dh_log("处理请求: %s", action.UTF8String);
+    if (fromLoaderPrefs) {
+        NSString *loaderPath = dh_jb_path(@"var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist");
+        if (!loaderPath.length) loaderPath = DH_LOADER_PREFS;
+        NSMutableDictionary *loader = [(dh_read_plist(loaderPath) ?: @{}) mutableCopy];
+        [loader removeObjectForKey:@"updaterRequest"];
+        dh_write_plist(loader, loaderPath);
+        chown(loaderPath.fileSystemRepresentation, 501, 501);
+        chmod(loaderPath.fileSystemRepresentation, 0644);
+    } else {
+        dh_write_plist(req, DH_REQUEST_PATH);
+    }
+    dh_log("处理请求: %s%s", action.UTF8String, fromLoaderPrefs ? " (loader-prefs)" : "");
     if ([action isEqualToString:DH_REQ_CHECK]) {
         dh_do_check();
     } else if ([action isEqualToString:DH_REQ_INSTALL]) {
@@ -1039,6 +1092,21 @@ int main(int argc, char *argv[]) {
         dh_log("启动");
         g_engine_dir = dh_existing_engine_dir();
         if (!g_engine_dir) {
+            NSString *fallbackDir = dh_existing_engine_dir_loose();
+            if (fallbackDir.length) {
+                NSDictionary *state = @{
+                    @"lastOp": @{
+                        @"kind": @"install",
+                        @"result": @"error",
+                        @"error": @"引擎不存在",
+                        @"time": @([[NSDate date] timeIntervalSince1970]),
+                    },
+                };
+                NSString *statePath = [fallbackDir stringByAppendingPathComponent:DH_STATE_FILE];
+                if (dh_write_plist(state, statePath)) {
+                    chmod(statePath.fileSystemRepresentation, 0644);
+                }
+            }
             dh_log("引擎目录不存在，退出");
             return 0;
         }

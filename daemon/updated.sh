@@ -5,6 +5,7 @@
 # staging 里已校验的引擎拷进目录，然后再跑 Mach-O（网络/解析）。
 set -e
 DIR=$(dirname "$0")
+JBROOT=$(cd "$DIR/../../.." 2>/dev/null && pwd)
 DAEMON="$DIR/IOSDecryptHubUpdated"
 DEST="$DIR/decrypt_helper.dylib"
 STAGE="/var/cache/com.iosdecrypthub"
@@ -27,7 +28,37 @@ sync_enabled() {
         chown mobile:mobile "$CFGDIR" "$CFG" 2>/dev/null || true
     fi
 }
+
+sync_request() {
+    REQ_REAL="/var/mobile/Library/Preferences/com.iosdecrypthub.updater.request.plist"
+    for REQ_SRC in \
+        "$JBROOT/var/mobile/Library/Preferences/com.iosdecrypthub.updater.request.plist" \
+        "$JBROOT/var/mobile/Library/Caches/com.iosdecrypthub/updater.request.plist" \
+        "/var/mobile/Library/Caches/com.iosdecrypthub/updater.request.plist" \
+        "/var/mobile/Library/Preferences/com.iosdecrypthub.updater.request.plist" \
+        "$DIR/config/updater.request.plist"; do
+        [ -f "$REQ_SRC" ] || continue
+        if grep -q '<key>action</key><string>none</string>' "$REQ_SRC" 2>/dev/null; then
+            rm -f "$REQ_SRC" 2>/dev/null || true
+            continue
+        fi
+        cp "$REQ_SRC" "$REQ_REAL" 2>/dev/null || true
+        chown mobile:mobile "$REQ_REAL" 2>/dev/null || true
+        chmod 0644 "$REQ_REAL" 2>/dev/null || true
+        rm -f "$REQ_SRC" 2>/dev/null || true
+    done
+}
+
+sync_state() {
+    SRC="$JBROOT/var/log/com.iosdecrypthub.updater.state.plist"
+    DST="$DIR/state.plist"
+    [ -f "$SRC" ] || return 0
+    cp "$SRC" "$DST" 2>/dev/null || true
+    chmod 0644 "$DST" 2>/dev/null || true
+}
+
 sync_enabled
+sync_request
 
 apply_new() {
     [ -f "$NEW" ] || return 0
@@ -65,4 +96,5 @@ fi
 apply_new
 "$DAEMON" || true
 apply_new
+sync_state
 sync_enabled

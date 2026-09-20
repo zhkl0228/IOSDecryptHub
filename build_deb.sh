@@ -383,6 +383,20 @@ if [ ! -f "\$REQUEST_PATH" ]; then
 fi
 chown mobile:mobile "\$REQUEST_PATH" 2>/dev/null || true
 chmod 0644 "\$REQUEST_PATH" 2>/dev/null || true
+# jb config 请求文件：App 一定能写；updated.sh 会在 daemon 前转交到 REQUEST_PATH。
+JB_REQUEST_PATH="${PREFIX}/usr/lib/IOSDecryptHub/config/updater.request.plist"
+if [ ! -f "\$JB_REQUEST_PATH" ]; then
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<plist version="1.0"><dict><key>action</key><string>none</string></dict></plist>' > "\$JB_REQUEST_PATH"
+fi
+chown mobile:mobile "\$JB_REQUEST_PATH" 2>/dev/null || true
+chmod 0666 "\$JB_REQUEST_PATH" 2>/dev/null || true
+# App 共享缓存目录里的请求文件：roothide 下 App 一定可写。
+CACHE_REQUEST_PATH="/var/mobile/Library/Caches/com.iosdecrypthub/updater.request.plist"
+if [ ! -f "\$CACHE_REQUEST_PATH" ]; then
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<plist version="1.0"><dict><key>action</key><string>none</string></dict></plist>' > "\$CACHE_REQUEST_PATH"
+fi
+chown mobile:mobile "\$CACHE_REQUEST_PATH" 2>/dev/null || true
+chmod 0666 "\$CACHE_REQUEST_PATH" 2>/dev/null || true
 # rootHide 在 jbroot=/ 时会把 LaunchDaemon 里的路径改写成 .jbroot-*/...，
 # launchd exec 返回 78（实测）。改用 /bin/sh 执行短路径脚本，
 # WatchPaths 盯 App 实际写入的 /var/mobile（不要走 .jbroot 前缀）。
@@ -399,6 +413,8 @@ printf '%s\n' \
     '<key>WatchPaths</key><array>' \
     '<string>/var/mobile/Library/Preferences/com.iosdecrypthub.updater.request.plist</string>' \
     '<string>/var/mobile/Library/Preferences/com.iosdecrypthub.loader.plist</string>' \
+    '<string>/var/mobile/Library/Caches/com.iosdecrypthub/updater.request.plist</string>' \
+    "<string>${PREFIX}/usr/lib/IOSDecryptHub/config/updater.request.plist</string>" \
     '</array>' \
     '<key>StartInterval</key><integer>43200</integer>' \
     '<key>RunAtLoad</key><false/>' \
