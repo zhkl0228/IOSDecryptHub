@@ -694,10 +694,17 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         NSString *bundle = q[@"bundle"];
         if (![bundle isKindOfClass:[NSString class]] || !bundle.length) { sendJSON(fd, @{@"ok": @NO, @"err": @"缺 bundle"}); return; }
         BOOL killed = killAppByBundle(bundle);
-        if (killed) usleep(400000);   // 等旧进程退干净再启动,否则 SBSLaunch 会前台已有实例(不重启)
+        if (killed) usleep(400000);   // 等旧进程退干净再冷启动
+        // 智能:配了 Frida JS 且 frida 可用 → 写请求让 dh_frida spawn+注入(冷启动即注入);否则 uiopen 普通启动。
+        if (dh_frida_available() && [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]) {
+            BOOL w = [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            sendJSON(fd, @{@"ok": @(w), @"killed": @(killed), @"frida": @YES,
+                           @"note": w ? @"已请求 frida 启动并注入 JS(看脚本日志)" : @"写 frida 请求失败"});
+            return;
+        }
         BOOL launched = launchApp(bundle);
-        sendJSON(fd, @{@"ok": @(launched), @"killed": @(killed), @"launched": @(launched),
-                       @"note": launched ? @"已重启(引擎随之注入)" : (killed ? @"已结束但启动失败(daemon 拉起 App 权限不足?手动打开)" : @"未在运行,尝试启动失败") });
+        sendJSON(fd, @{@"ok": @(launched), @"killed": @(killed), @"launched": @(launched), @"frida": @NO,
+                       @"note": launched ? @"已重启(uiopen 普通启动)" : (killed ? @"已结束但启动失败(权限?手动打开)" : @"未在运行,尝试启动失败") });
         return;
     }
     // 保持前台:单值目标(bundle 空=关闭)。独立于注入名单;监控线程按 suspend_count 判定 + uiopen 拉前台。

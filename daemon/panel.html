@@ -27,6 +27,7 @@ a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
 .sw input:checked+.sl{background:var(--on)}
 .sw input:checked+.sl:before{transform:translateX(19px)}
 .btn{display:inline-block;padding:5px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer;font-size:13px;line-height:1.4}
+.btn.inj{border-color:var(--ac);color:var(--ac)}
 .btn:hover{border-color:var(--ac)}.btn:active{opacity:.55}
 .txt{padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#0b0d12;color:var(--fg);width:300px;max-width:60vw}
 .row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -148,7 +149,7 @@ function renderA(){
       +      ' onchange="togA(\''+esc(x.bundle)+'\',this.checked)"><span class="sl"></span></label></td>'
       +  '<td>'+run+'</td>'
       +  '<td>'+eng+'</td>'
-      +  '<td><button class="btn" onclick="rstA(\''+esc(x.bundle)+'\')">'+(x.running?'重启':'启动')+'</button> '
+      +  '<td><button class="btn'+((x.fridaJS&&_fridaAvail)?' inj':'')+'" onclick="rstA(\''+esc(x.bundle)+'\')" title="'+((x.fridaJS&&_fridaAvail)?'重启并注入 Frida JS':'普通重启(uiopen)')+'">'+(x.running?'重启':'启动')+'</button> '
       +      (_fridaAvail?'<button class="btn" onclick="fridaEdit(\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')">Frida'+(x.fridaJS?' ●':'')+'</button>':'')+'</td></tr>';
   });
   if(!list.length) h += '<tr><td class="muted" colspan="7">无匹配</td></tr>';
