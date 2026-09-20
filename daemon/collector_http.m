@@ -562,15 +562,22 @@ static NSDictionary *controlAppData(void) {
     NSSet *en = [NSSet setWithArray:cfgMembers(DH_KEY_BUNDLES)];
     NSDictionary *ports = appInjectMap();
     NSString *fgKeep = cfgGetScalar(DH_KEY_FGKEEP);   // 当前「保持前台」目标(单值)
+    // 前台判定优先用【真 frontmost】:SpringBoard 里的 DHUnlock 把 _accessibilityFrontMostApplication 写
+    // /var/jb/tmp/dh_frontmost(唯一、切换即时准确)。文件 nil=没装 DHUnlock → 退回 suspend_count 猜(对 VPN 类
+    // 后台常驻 App 长期 suspend=0、切后台宽限期都会误判,且可能同时报多个)。文件为空="桌面/无前台"。
+    NSString *fmRaw = [NSString stringWithContentsOfFile:@"/var/jb/tmp/dh_frontmost" encoding:NSUTF8StringEncoding error:nil];
+    BOOL haveFm = (fmRaw != nil);
+    NSString *fmBundle = [(fmRaw ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSMutableArray *out = [NSMutableArray array];
-    NSMutableArray *fgNames = [NSMutableArray array]; // 当前前台 App(suspend_count==0)的名字,给控制台显示
+    NSMutableArray *fgNames = [NSMutableArray array]; // fallback(无 DHUnlock):suspend==0 的 App 名
+    NSString *fmName = @"";                            // 有 DHUnlock:真 frontmost App 名
     for (NSDictionary *a in enumApps()) {
         NSString *bundle = a[@"bundle"], *exec = a[@"exec"];
         int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
-        // 前台判定:running 才查 suspend_count(task_for_pid 一次);0=前台/活跃,>0=后台被挂起,<0=拿不到。
-        int sc = pid ? dh_task_suspend_count(pid) : -1;
-        BOOL foreground = (pid != 0 && sc == 0);
-        if (foreground) [fgNames addObject:a[@"name"]];
+        int sc = pid ? dh_task_suspend_count(pid) : -1;   // 仍上报供参考;前台判定优先真 frontmost
+        BOOL foreground = haveFm ? (pid != 0 && fmBundle.length && [bundle isEqualToString:fmBundle])
+                                 : (pid != 0 && sc == 0);
+        if (foreground) { [fgNames addObject:a[@"name"]]; fmName = a[@"name"]; }
         NSArray *pe = ports[bundle];   // @[port, ver] 或 nil(未注入)
         BOOL injected = pe != nil;
         [out addObject:@{ @"bundle": bundle, @"name": a[@"name"], @"system": a[@"system"],
@@ -582,10 +589,13 @@ static NSDictionary *controlAppData(void) {
                           @"port": injected ? pe[0] : @0,
                           @"version": injected ? ([pe[1] length] ? pe[1] : @ENGINE_VER) : @"" }];
     }
+    // 有 DHUnlock:显示真 frontmost 名(列表里没匹配到就退回 bundle id);无 DHUnlock:suspend==0 的名(可能多个)
+    NSString *fgShow = haveFm ? (fmName.length ? fmName : fmBundle)
+                              : [fgNames componentsJoinedByString:@" / "];
     float bright = dh_screen_brightness();
     return @{ @"apps": out, @"engineVer": @ENGINE_VER,
               @"fgKeep": fgKeep ?: @"",
-              @"foreground": [fgNames componentsJoinedByString:@" / "],
+              @"foreground": fgShow,
               @"screenOn": @(bright > 0.0f),        // 亮屏/息屏(collector 直接读亮度)
               @"locked": @(dh_screen_locked()) };   // 1=锁屏 0=已解锁 -1=未知(没装 DHUnlock)
 }

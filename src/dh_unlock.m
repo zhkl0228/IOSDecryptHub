@@ -30,6 +30,9 @@
 #define DH_CFG_PATH       @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
 #define DH_KEY_FGKEEP     @"foregroundKeep"
 #define DH_LOCKSTATE_FILE @"/var/jb/tmp/dh_lockstate"   // 写 isUILocked("1"锁/"0"解),供 collector 读给 web 显示
+#define DH_FRONTMOST_FILE @"/var/jb/tmp/dh_frontmost"   // 写真 frontmost App 的 bundle id(空=桌面/无),供 collector 读
+
+static dispatch_source_t g_fg_timer;   // 前台 App 查询定时器(主队列)
 
 static inline id dh_msg0(id obj, const char *sel) {
     return ((id (*)(id, SEL))objc_msgSend)(obj, sel_getUid(sel));
@@ -53,6 +56,29 @@ static void dh_write_lockstate_async(void) {
         }
         [(locked ? @"1" : @"0") writeToFile:DH_LOCKSTATE_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
+}
+
+// 【主队列】查真正的前台 App(SpringBoard 内部 frontmost)写文件供 collector 用。
+// 为什么不让 collector 用 suspend_count 猜:VPN 等有后台执行权的 App 长期 suspend_count=0、且 App 切后台后
+// iOS 有几十秒挂起宽限期 suspend_count 才变——都会误判前台(实测同时误报 InspectorVpn/Safari)。
+// _accessibilityFrontMostApplication 是 SpringBoard 的真 frontmost:唯一、前后台切换即时准确。桌面/锁屏返回 nil。
+static void dh_write_frontmost(void) {
+    Class ua = objc_getClass("UIApplication");
+    if (!ua) return;
+    id app = dh_msg0((id)ua, "sharedApplication");
+    if (!app) return;
+    NSString *bid = @"";
+    SEL sel = sel_getUid("_accessibilityFrontMostApplication");
+    static int logged = 0;
+    if (!logged) { syslog(LOG_NOTICE, UNLOCK_TAG " _accessibilityFrontMostApplication resp=%d", [app respondsToSelector:sel]); logged = 1; }
+    if ([app respondsToSelector:sel]) {
+        id sb = ((id (*)(id, SEL))objc_msgSend)(app, sel);
+        if (sb) {
+            id b = dh_msg0(sb, "bundleIdentifier");
+            if ([b isKindOfClass:[NSString class]]) bid = b;
+        }
+    }
+    [bid writeToFile:DH_FRONTMOST_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 // 【主队列】真正解锁 + 回桌面(照 rp tryUnlockDevice)。
@@ -116,5 +142,12 @@ static void dh_unlock_init(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dh_write_lockstate_async();
     });
-    syslog(LOG_NOTICE, UNLOCK_TAG " 已装(照 rp:延迟+主线程解锁+回桌面;设了 foregroundKeep 即自动解锁)");
+    // 前台 App:主队列定时(每 1s,5s 后启动等 SpringBoard 就绪)查真 frontmost 写文件。轻量(一次 msgSend+写小文件),
+    // 换来准确即时(取代 collector 用 suspend_count 猜——那对 VPN 类后台常驻 App 和切后台宽限期都会误判)。
+    g_fg_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(g_fg_timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                              (uint64_t)(1 * NSEC_PER_SEC), (uint64_t)(200 * NSEC_PER_MSEC));
+    dispatch_source_set_event_handler(g_fg_timer, ^{ dh_write_frontmost(); });
+    dispatch_resume(g_fg_timer);
+    syslog(LOG_NOTICE, UNLOCK_TAG " 已装(照 rp:延迟+主线程解锁+回桌面;设了 foregroundKeep 即自动解锁;前台查询已启)");
 }
