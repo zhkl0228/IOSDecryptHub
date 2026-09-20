@@ -81,6 +81,12 @@ COLLECTOR_LABEL="com.iosdecrypthub.collector"
 DHUNLOCK_SRC="$SCRIPT_DIR/src/dh_unlock.m"
 DHUNLOCK_PLIST_SRC="$SCRIPT_DIR/src/DHUnlock.plist"
 DHUNLOCK_DYLIB="DHUnlock.dylib"
+# Frida 编排 daemon(可选:需 vendor/frida-core-devkit,176MB 不入 git;无则跳过不阻断构建)
+FRIDA_SRC="$SCRIPT_DIR/src/dh_frida.c"
+FRIDA_BIN="IOSDecryptHubFrida"
+FRIDA_LABEL="com.iosdecrypthub.frida"
+FRIDA_DEVKIT="$SCRIPT_DIR/vendor/frida-core-devkit"
+FRIDA_ENT="$SCRIPT_DIR/daemon/frida_entitlements.plist"
 
 compile_loader() {
     local ARCHS="$1"
@@ -189,6 +195,18 @@ compile_dhunlock() {
         "$DHUNLOCK_SRC" -o "$OUT"
 }
 
+# Frida 编排 daemon:C 链 frida-core devkit 静态库(自带 GLib);arm64(独立进程)。连 frida-server spawn+注入。
+compile_frida() {
+    local OUT="$1"
+    info "编译 dh_frida (arm64, 链 frida-core devkit)..."
+    mkdir -p "$(dirname "$OUT")"
+    $CC -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 -Wall -O2 \
+        "$FRIDA_SRC" -I"$FRIDA_DEVKIT" -L"$FRIDA_DEVKIT" -lfrida-core \
+        -lbsm -ldl -lm -lresolv \
+        -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework UIKit \
+        -o "$OUT"
+}
+
 # 由 dh_daemons.h 的 DH_DAEMON(exec,...) 单一来源生成 companion 的 Filter → Executables plist。
 gen_companion_filter() {
     local OUT="$1"
@@ -269,6 +287,14 @@ build_variant() {
     gen_companion_filter "$COMPANION_FILTER_OUT"
     # 自动解锁组件:注入 SpringBoard,需 arm64e 切片(SpringBoard 是 arm64e 进程)
     compile_dhunlock "$MACHO_ARCHS" "$DHUNLOCK_OUT"
+    # Frida 编排 daemon(可选:有 devkit 才编;无则跳过,不阻断构建)
+    local FRIDA_OUT="$BUILD_DIR/_frida-${VARIANT}/$FRIDA_BIN"
+    local HAVE_FRIDA=0
+    if [ -f "$FRIDA_DEVKIT/libfrida-core.a" ]; then
+        compile_frida "$FRIDA_OUT"; HAVE_FRIDA=1
+    else
+        warn "跳过 dh_frida:未找到 $FRIDA_DEVKIT/libfrida-core.a(可选,frida releases 下载后放此处)"
+    fi
 
     info "打包 $VARIANT (arch=$ARCHITECTURE, prefix=${PREFIX:-/})..."
     rm -rf "$STAGE"
@@ -309,6 +335,9 @@ CTRL
     # 引擎 WebUI 快照 + 聚合控制台 SPA:collector 托管(用 _NSGetExecutablePath 定位同目录)。
     cp "$SCRIPT_DIR/daemon/webui.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/webui.html"
     cp "$SCRIPT_DIR/daemon/panel.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/panel.html"
+    # Frida 编排 daemon + JS 目录(可选组件:有 devkit 才装二进制;JS 目录总是建,供 collector 写 <bundle>.js)
+    mkdir -p "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/frida"
+    [ "$HAVE_FRIDA" = 1 ] && cp "$FRIDA_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$FRIDA_BIN"
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \
@@ -473,6 +502,28 @@ if command -v launchctl >/dev/null 2>&1; then
     launchctl bootout system "\$COLLECTOR_PLIST" 2>/dev/null || true
     launchctl bootstrap system "\$COLLECTOR_PLIST" 2>/dev/null || launchctl load "\$COLLECTOR_PLIST" 2>/dev/null || true
 fi
+# Frida 编排 daemon(可选:装了二进制才注册;root 常驻 RunAtLoad+KeepAlive,连 frida-server spawn+注入)
+FRIDA_BIN_PATH="${PREFIX}/usr/lib/IOSDecryptHub/IOSDecryptHubFrida"
+if [ -x "\$FRIDA_BIN_PATH" ]; then
+    FRIDA_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.frida.plist"
+    printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0"><dict>' \
+        '<key>Label</key><string>com.iosdecrypthub.frida</string>' \
+        '<key>ProgramArguments</key><array>' \
+        "<string>\$FRIDA_BIN_PATH</string>" \
+        '</array>' \
+        '<key>RunAtLoad</key><true/>' \
+        '<key>KeepAlive</key><true/>' \
+        '<key>StandardOutPath</key><string>/var/log/iosdecrypthub-frida.log</string>' \
+        '<key>StandardErrorPath</key><string>/var/log/iosdecrypthub-frida.log</string>' \
+        '</dict></plist>' > "\$FRIDA_PLIST"
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl bootout system "\$FRIDA_PLIST" 2>/dev/null || true
+        launchctl bootstrap system "\$FRIDA_PLIST" 2>/dev/null || launchctl load "\$FRIDA_PLIST" 2>/dev/null || true
+    fi
+fi
 # 刷新主屏幕图标（失败不阻断安装）
 if command -v uicache >/dev/null 2>&1; then
     uicache -p "${PREFIX}/Applications/$APP_NAME.app" 2>/dev/null || true
@@ -487,9 +538,11 @@ set -e
 if [ "\$1" = "remove" ]; then
     LAUNCHD_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.updated.plist"
     COLLECTOR_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.collector.plist"
+    FRIDA_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.frida.plist"
     if command -v launchctl >/dev/null 2>&1; then
         launchctl bootout system "\$LAUNCHD_PLIST" 2>/dev/null || true
         launchctl bootout system "\$COLLECTOR_PLIST" 2>/dev/null || true
+        launchctl bootout system "\$FRIDA_PLIST" 2>/dev/null || true
     fi
 fi
 if [ "\$1" = "purge" ]; then
@@ -527,6 +580,7 @@ POSTRM
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$DHUNLOCK_DYLIB"
     ldid -S"$SCRIPT_DIR/daemon/collector_entitlements.plist" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
+    [ "$HAVE_FRIDA" = 1 ] && ldid -S"$FRIDA_ENT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$FRIDA_BIN"
 
     cp -R "$STAGE/." "$PKG_STAGE/"
     find "$PKG_STAGE" -type d -exec chmod 0755 {} +
@@ -542,6 +596,7 @@ POSTRM
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     chmod 0755 "$PKG_STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
+    [ "$HAVE_FRIDA" = 1 ] && chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$FRIDA_BIN"
 
     if ! dpkg-deb --build --root-owner-group "$PKG_STAGE" "$DEB_OUT" 2>"$BUILD_DIR/_dpkg-$VARIANT.log"; then
         rm -rf "$PKG_STAGE"

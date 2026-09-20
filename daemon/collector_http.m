@@ -47,7 +47,10 @@ extern int  dh_task_suspend_count(int pid);                     // collector.c:t
 #define DH_KEY_FGKEEP  @"foregroundKeep"        // 「保持前台」目标 bundle id(单值;空/缺=关闭);独立于注入名单
 // SpringBoard 里的 DHUnlock 读 foregroundKeep:非空即在锁屏时自动解锁(两者绑定,无单独开关)。
 #define DH_UNLOCK_NOTIFY  "com.iosdecrypthub.unlock"   // 手动解锁 darwin 通知(DHUnlock 监听)
+#define DH_FRIDA_DIR   @"/var/jb/usr/lib/IOSDecryptHub/frida"   // Frida JS 脚本目录(<bundle>.js)
+#define DH_FRIDA_REQ   @"/var/jb/tmp/dh-frida-req"              // 写 bundle id → dh_frida daemon spawn+注入
 static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
+static NSString *fridaJsPath(NSString *bundle);   // fwd(Frida JS 路径,定义在 handleControl 前)
 // 门控 config 读:key 下的数组是否含 val。key = DH_KEY_EXECS(daemon)/ DH_KEY_BUNDLES(App)。
 static BOOL cfgHasMember(NSString *key, NSString *val) {
     NSArray *a = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
@@ -104,6 +107,12 @@ static int dh_screen_locked(void) {
     NSString *s = [NSString stringWithContentsOfFile:@"/var/jb/tmp/dh_lockstate" encoding:NSUTF8StringEncoding error:nil];
     if (!s.length) return -1;
     return [s hasPrefix:@"1"] ? 1 : 0;
+}
+// 是否装了 Frida(dh_frida daemon 二进制需 devkit 构建才有 + frida-server 已装)。web 据此显示/隐藏 Frida 功能。
+static BOOL dh_frida_available(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    return [fm fileExistsAtPath:@"/var/jb/usr/lib/IOSDecryptHub/IOSDecryptHubFrida"]
+        && [fm fileExistsAtPath:@"/var/jb/usr/sbin/frida-server"];
 }
 
 // daemon 三态:live=引擎就绪可连活引擎 / idle=进程在但没注入引擎(未启用) / dead=进程已退出仅历史。
@@ -585,6 +594,7 @@ static NSDictionary *controlAppData(void) {
                           @"running": @(pid != 0), @"pid": @(pid),
                           @"suspend": @(sc), @"foreground": @(foreground),
                           @"keepFg": @([bundle isEqualToString:fgKeep]),
+                          @"fridaJS": @([[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]),
                           @"injected": @(injected),
                           @"port": injected ? pe[0] : @0,
                           @"version": injected ? ([pe[1] length] ? pe[1] : @ENGINE_VER) : @"" }];
@@ -597,7 +607,8 @@ static NSDictionary *controlAppData(void) {
               @"fgKeep": fgKeep ?: @"",
               @"foreground": fgShow,
               @"screenOn": @(bright > 0.0f),        // 亮屏/息屏(collector 直接读亮度)
-              @"locked": @(dh_screen_locked()) };   // 1=锁屏 0=已解锁 -1=未知(没装 DHUnlock)
+              @"locked": @(dh_screen_locked()),     // 1=锁屏 0=已解锁 -1=未知(没装 DHUnlock)
+              @"fridaAvail": @(dh_frida_available()) };  // 装了 Frida 才显示 web 上的 Frida 功能
 }
 // App 重启=结束进程(iOS App 非 launchd KeepAlive,kill 后由用户/系统重新打开时带上新注入)。按枚举到的
 // CFBundleExecutable 找 pid kill;只对枚举到的 App(不接受任意名),bundle 必须在 App 列表里。返回是否 kill。
@@ -623,6 +634,36 @@ static BOOL killAppByBundle(NSString *bundle) {
         return NO;
     }
     return NO;
+}
+
+// bundle id 合法性(防路径穿越/命令注入):只允许 [A-Za-z0-9.-_],长度 ≤128。
+static BOOL validBundle(NSString *b) {
+    if (!b.length || b.length > 128) return NO;
+    NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:
+        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"];
+    return [[b stringByTrimmingCharactersInSet:ok] length] == 0;
+}
+static NSString *fridaJsPath(NSString *bundle) {
+    return [DH_FRIDA_DIR stringByAppendingPathComponent:[bundle stringByAppendingString:@".js"]];
+}
+// 读 HTTP 请求 body:handleConn 已把 header(可能连带部分 body)读进 buf,body 从 \r\n\r\n 后开始,按
+// Content-Length 续读到齐。用于保存 Frida JS 脚本(POST body 是脚本内容)。
+static NSData *readReqBody(int fd, const char *buf, size_t got) {
+    const char *bs = strstr(buf, "\r\n\r\n");
+    if (!bs) return [NSData data];
+    bs += 4;
+    NSMutableData *d = [NSMutableData dataWithBytes:bs length:got - (size_t)(bs - buf)];
+    const char *cl = strcasestr(buf, "\r\ncontent-length:");
+    long clen = cl ? atol(cl + 17) : -1;
+    if (clen < 0) return d;
+    char tmp[4096];
+    while ((long)d.length < clen) {
+        ssize_t r = read(fd, tmp, sizeof tmp);
+        if (r <= 0) break;
+        [d appendBytes:tmp length:(NSUInteger)r];
+    }
+    if ((long)d.length > clen) [d setLength:(NSUInteger)clen];
+    return d;
 }
 
 // POST /api/control/<action>:enable(kind=daemon/app)、restart(daemon)、restart-app(App)。
@@ -790,6 +831,60 @@ static void handleConn(int fd) {
         if ([path hasPrefix:@"/api/control/"]) {
             if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"控制操作用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
             handleControl(fd, [path substringFromIndex:13], parseQuery(query)); return;   // "/api/control/"=13
+        }
+        // Frida:保存 JS(POST body=脚本)/ 读 JS(GET)/ 启动注入(POST 写请求文件,dh_frida daemon 执行)
+        if ([path isEqualToString:@"/api/frida/save"]) {
+            if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+            NSData *js = readReqBody(fd, buf, got);
+            [[NSFileManager defaultManager] createDirectoryAtPath:DH_FRIDA_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+            BOOL w = [js writeToFile:fridaJsPath(bundle) atomically:YES];
+            sendJSON(fd, @{@"ok": @(w), @"bytes": @(js.length)}); return;
+        }
+        if ([path isEqualToString:@"/api/frida/get"]) {
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { send404(fd); return; }
+            NSString *js = [NSString stringWithContentsOfFile:fridaJsPath(bundle) encoding:NSUTF8StringEncoding error:nil];
+            sendText(fd, js ?: @""); return;
+        }
+        if ([path isEqualToString:@"/api/frida/launch"]) {
+            if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+            if (![[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]) { sendJSON(fd, @{@"ok": @NO, @"err": @"该 App 未设置 Frida JS"}); return; }
+            BOOL w = [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            sendJSON(fd, @{@"ok": @(w), @"note": @"已请求 dh_frida spawn+注入(需 frida-server + dh_frida daemon)"}); return;
+        }
+        // Frida 脚本消息(console.log/send):读 dh_frida 落的 /var/log/dh-frida.jsonl 尾部,可按 bundle 过滤。
+        if ([path isEqualToString:@"/api/frida/log"]) {
+            NSDictionary *q = parseQuery(query);
+            NSString *fb = q[@"bundle"];
+            NSInteger lim = [q[@"limit"] length] ? [q[@"limit"] integerValue] : 200;
+            if (lim <= 0 || lim > 2000) lim = 200;
+            NSMutableArray *out = [NSMutableArray array];
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:@"/var/log/dh-frida.jsonl"];
+            if (fh) {
+                unsigned long long sz = [fh seekToEndOfFile], cap = 512 * 1024;
+                [fh seekToFileOffset:(sz > cap ? sz - cap : 0)];
+                NSData *d = [fh readDataToEndOfFile]; [fh closeFile];
+                NSString *raw = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+                for (NSString *ln in [raw componentsSeparatedByString:@"\n"]) {
+                    if (!ln.length) continue;
+                    NSDictionary *o = [NSJSONSerialization JSONObjectWithData:[ln dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                    if (![o isKindOfClass:[NSDictionary class]]) continue;   // 尾部截断的首行/坏行跳过
+                    if (fb.length && ![o[@"bundle"] isEqualToString:fb]) continue;
+                    [out addObject:o];
+                }
+            }
+            if ((NSInteger)out.count > lim) [out removeObjectsInRange:NSMakeRange(0, out.count - lim)];
+            sendJSON(fd, @{@"items": out}); return;
+        }
+        // 清空 Frida 脚本日志(删整个 jsonl;dh_frida 下次 append 会重建)
+        if ([path isEqualToString:@"/api/frida/clearlog"]) {
+            if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+            [[NSFileManager defaultManager] removeItemAtPath:@"/var/log/dh-frida.jsonl" error:nil];
+            sendJSON(fd, @{@"ok": @YES}); return;
         }
         if (!isGet) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"仅支持 GET" dataUsingEncoding:NSUTF8StringEncoding]); return; }
 

@@ -31,6 +31,12 @@ a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
 .txt{padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#0b0d12;color:var(--fg);width:300px;max-width:60vw}
 .row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#1b2230;border:1px solid var(--line);padding:10px 18px;border-radius:10px;opacity:0;transition:.2s;pointer-events:none;max-width:80vw}
+#fovl{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
+.fbox{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;width:min(92vw,720px);max-height:86vh;display:flex;flex-direction:column}
+.fhdr{font-weight:600;margin-bottom:10px}
+#fjs{width:100%;height:52vh;box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px;font:13px/1.5 ui-monospace,Menlo,monospace}
+.frow{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#flog{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.45 ui-monospace,Menlo,monospace;height:20vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
 #toast.show{opacity:1}
 .err{color:#e6788a}
 </style></head><body>
@@ -98,11 +104,12 @@ async function rst(p){
 }
 
 /* ---- App ---- */
-var _apps = [];
+var _apps = [], _fridaAvail = false;
 async function loadA(){
   var a;
   try{ a = await (await fetch("/api/control/list?kind=app")).json(); }catch(e){ return; }
   _apps = a.apps || [];
+  _fridaAvail = !!a.fridaAvail;
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
         '<div class="row-actions" style="margin-bottom:8px"><button class="btn" onclick="unlockDev()">解锁/亮屏</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
@@ -141,7 +148,8 @@ function renderA(){
       +      ' onchange="togA(\''+esc(x.bundle)+'\',this.checked)"><span class="sl"></span></label></td>'
       +  '<td>'+run+'</td>'
       +  '<td>'+eng+'</td>'
-      +  '<td>'+(x.running?'<button class="btn" onclick="rstA(\''+esc(x.bundle)+'\')">重启</button>':'<span class="muted">—</span>')+'</td></tr>';
+      +  '<td><button class="btn" onclick="rstA(\''+esc(x.bundle)+'\')">'+(x.running?'重启':'启动')+'</button> '
+      +      (_fridaAvail?'<button class="btn" onclick="fridaEdit(\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')">Frida'+(x.fridaJS?' ●':'')+'</button>':'')+'</td></tr>';
   });
   if(!list.length) h += '<tr><td class="muted" colspan="7">无匹配</td></tr>';
   h += '</table>';
@@ -153,9 +161,9 @@ async function togA(b,on){
   else toast("失败:"+(r.err||""), true);
 }
 async function rstA(b){
-  toast("结束 "+b+" …");
+  toast("处理 "+b+" …");
   var r = await post("/api/control/restart-app?bundle="+encodeURIComponent(b));
-  toast(r.ok ? (b+" 已结束进程,重新打开即注入") : (r.note||"未在运行"), !r.ok);
+  toast(r.note || (r.ok?"已处理":"失败"), !r.ok);
   setTimeout(loadA, 1500);
 }
 async function keepFg(b){
@@ -168,6 +176,62 @@ async function unlockDev(){
   toast(r.ok ? "已亮屏 + 发解锁通知(需装 DHUnlock 才真解锁)" : "失败", !r.ok);
 }
 
+function fridaClose(){ var o=document.getElementById("fovl"); if(o)o.style.display="none"; if(window._flogTimer){clearInterval(window._flogTimer);window._flogTimer=null;} }
+async function fridaClearLog(b){
+  try{ await fetch("/api/frida/clearlog",{method:"POST"}); }catch(e){}
+  var el=document.getElementById("flog"); if(el) el.textContent="(已清空)";
+}
+function fmtFridaMsg(m){
+  if(!m) return '';
+  if(m.type==='log') return '[log] '+m.payload;
+  if(m.type==='send') return '[send] '+JSON.stringify(m.payload);
+  if(m.type==='error') return '[error'+(m.stage?' '+m.stage:'')+'] '+(m.payload||m.description||m.stack||JSON.stringify(m));
+  if(m.type==='detached') return '[detached] reason='+m.reason+(m.crash?' ⚠崩溃':'');
+  return JSON.stringify(m);
+}
+async function fridaLogPoll(b){
+  try{
+    var j = await (await fetch("/api/frida/log?bundle="+encodeURIComponent(b)+"&limit=300")).json();
+    var el=document.getElementById("flog"); if(!el) return;
+    var items=j.items||[];
+    el.textContent = items.length ? items.map(function(it){
+      var t=new Date(it.tsMs); var hh=("0"+t.getHours()).slice(-2)+":"+("0"+t.getMinutes()).slice(-2)+":"+("0"+t.getSeconds()).slice(-2);
+      return hh+' '+fmtFridaMsg(it.msg);
+    }).join('\n') : '(暂无脚本消息;启动并注入后 console.log/send 会显示在这)';
+    el.scrollTop=el.scrollHeight;
+  }catch(e){}
+}
+async function fridaEdit(b,name){
+  var js="";
+  try{ js = await (await fetch("/api/frida/get?bundle="+encodeURIComponent(b))).text(); }catch(e){}
+  var ov=document.getElementById("fovl");
+  if(!ov){ ov=document.createElement("div"); ov.id="fovl"; ov.onclick=function(ev){ if(ev.target===ov) fridaClose(); }; document.body.appendChild(ov); }
+  ov.innerHTML='<div class="fbox"><div class="fhdr">Frida JS — '+esc(name)+' <span class="muted">'+esc(b)+'</span></div>'
+    +'<textarea id="fjs" spellcheck="false" placeholder="// frida 脚本,例: console.log(Process.id); Interceptor.attach(...)"></textarea>'
+    +'<div class="frow"><button class="btn" onclick="fridaSave(\''+esc(b)+'\')">保存</button>'
+    +'<button class="btn" onclick="fridaLaunch(\''+esc(b)+'\')">保存并启动注入</button>'
+    +'<button class="btn" onclick="fridaClose()">关闭</button><span class="muted" id="fmsg"></span></div>'
+    +'<div class="muted" style="margin-top:8px">启动注入 = frida spawn 该 App → resume → attach → 注入此 JS(需 frida-server + IOSDecryptHubFrida daemon)。</div>'
+    +'<div class="fhdr" style="margin-top:10px">脚本日志 <span class="muted">console.log / send(每 1.5s 刷新)</span> <button class="btn" style="float:right" onclick="fridaClearLog(\''+esc(b)+'\')">清空日志</button></div><pre id="flog"></pre></div>';
+  ov.style.display="flex";
+  document.getElementById("fjs").value=js;
+  fridaLogPoll(b);
+  if(window._flogTimer) clearInterval(window._flogTimer);
+  window._flogTimer=setInterval(function(){ fridaLogPoll(b); }, 1500);
+}
+async function fridaSave(b){
+  var js=document.getElementById("fjs").value;
+  try{ var j=await (await fetch("/api/frida/save?bundle="+encodeURIComponent(b),{method:"POST",body:js})).json();
+    document.getElementById("fmsg").textContent=j.ok?("已保存 "+j.bytes+" 字节"):("失败:"+(j.err||"")); return j.ok;
+  }catch(e){ var m=document.getElementById("fmsg"); if(m)m.textContent="网络错误"; return false; }
+}
+async function fridaLaunch(b){
+  if(!(await fridaSave(b))) return;
+  try{ var j=await (await fetch("/api/frida/launch?bundle="+encodeURIComponent(b),{method:"POST"})).json();
+    document.getElementById("fmsg").textContent=j.ok?"已请求启动注入(看设备)":("失败:"+(j.err||""));
+    if(j.ok) setTimeout(loadA,1500);
+  }catch(e){ var m=document.getElementById("fmsg"); if(m)m.textContent="网络错误"; }
+}
 loadA();
 setInterval(function(){ if(curTab()=="daemon") loadD(); else loadA(); }, 1500);
 </script>

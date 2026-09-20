@@ -7,6 +7,10 @@ build/
 # 引擎打补丁前的原件备份（可随时从上游重新下载，见 tools/patch_engine_arm64e_pac.py）
 *.pristine
 
+# frida-core devkit（~176MB libfrida-core.a，从 frida releases 下载,版本匹配 frida-server，见 src/dh_frida.c）
+#   下载:https://github.com/frida/frida/releases/download/<ver>/frida-core-devkit-<ver>-ios-arm64.tar.xz
+vendor/frida-core-devkit/
+
 .DS_Store
 *.swp
 .claude/
