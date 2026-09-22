@@ -210,12 +210,13 @@ async function fridaLogPoll(b){
   try{
     var j = await (await fetch("/api/frida/log?bundle="+encodeURIComponent(b)+"&limit=300")).json();
     var el=document.getElementById("flog"); if(!el) return;
+    var atBottom=(el.scrollHeight - el.scrollTop - el.clientHeight) < 30;   // 刷新前是否贴着底部
     var items=j.items||[];
     el.textContent = items.length ? items.map(function(it){
       var t=new Date(it.tsMs); var hh=("0"+t.getHours()).slice(-2)+":"+("0"+t.getMinutes()).slice(-2)+":"+("0"+t.getSeconds()).slice(-2);
       return hh+' '+fmtFridaMsg(it.msg);
     }).join('\n') : '(暂无脚本消息;启动并注入后 console.log/send 会显示在这)';
-    el.scrollTop=el.scrollHeight;
+    if(atBottom) el.scrollTop=el.scrollHeight;   // 只在原本贴底时才自动跟最新;上拉看旧日志则保持位置
   }catch(e){}
 }
 async function fridaEdit(b,name){

@@ -114,6 +114,19 @@ static BOOL dh_frida_available(void) {
     return [fm fileExistsAtPath:@"/var/jb/usr/lib/IOSDecryptHub/IOSDecryptHubFrida"]
         && [fm fileExistsAtPath:@"/var/jb/usr/sbin/frida-server"];
 }
+// frida 真就绪:二进制在 + frida-server 27042 可连(重启后 frida-server 晚起,二进制在≠就绪)。
+// 保活自启的 frida spawn 据此判断——没就绪就先别启动、等 frida 起来,避免拿无 frida 方式把 App 占位。
+static BOOL dh_frida_ready(void) {
+    if (!dh_frida_available()) return NO;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return NO;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(27042); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct timeval tv = {1, 0}; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int r = connect(s, (struct sockaddr *)&a, sizeof a);
+    close(s);
+    return r == 0;
+}
 
 // daemon 三态:live=引擎就绪可连活引擎 / idle=进程在但没注入引擎(未启用) / dead=进程已退出仅历史。
 // 返回并回填 lan_port(仅 live 有意义)。
@@ -649,10 +662,14 @@ static NSString *fridaJsPath(NSString *bundle) {
 // 智能启动(冷启动场景用):配了 Frida JS 且 frida 可用 → 写请求让 dh_frida frida spawn+注入;否则 uiopen。
 // 保持前台的退出自启、restart-app 都用它,保证配了 JS 的 App「启动即带 frida」。仅用于进程不在时(冷启动);
 // App 在运行时(后台拉回)不能用——frida spawn 是冷启动会冲突,那种情况用 launchApp(uiopen)激活。
+// 返回 YES=已启动 或 已发起 frida 注入请求;NO=配了 JS 但 frida 未就绪(没启动,调用方应稍后重试)。
 static BOOL launchAppSmart(NSString *bundle) {
-    if (dh_frida_available() && [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)])
+    BOOL hasJs = [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)];
+    if (hasJs) {
+        if (!dh_frida_ready()) return NO;   // 配了 JS 但 frida 没就绪 → 不用无 frida 方式占位启动,等下轮
         return [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    return launchApp(bundle);
+    }
+    return launchApp(bundle);   // 没配 JS → 普通 uiopen
 }
 // 读 HTTP 请求 body:handleConn 已把 header(可能连带部分 body)读进 buf,body 从 \r\n\r\n 后开始,按
 // Content-Length 续读到齐。用于保存 Frida JS 脚本(POST body 是脚本内容)。
@@ -704,7 +721,8 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         BOOL killed = killAppByBundle(bundle);
         if (killed) usleep(400000);   // 等旧进程退干净再冷启动
         // 智能:配了 Frida JS 且 frida 可用 → 写请求让 dh_frida spawn+注入(冷启动即注入);否则 uiopen 普通启动。
-        if (dh_frida_available() && [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]) {
+        BOOL hasJs = [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)];
+        if (hasJs && dh_frida_ready()) {
             BOOL w = [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
             sendJSON(fd, @{@"ok": @(w), @"killed": @(killed), @"frida": @YES,
                            @"note": w ? @"已请求 frida 启动并注入 JS(看脚本日志)" : @"写 frida 请求失败"});
@@ -712,7 +730,7 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         }
         BOOL launched = launchApp(bundle);
         sendJSON(fd, @{@"ok": @(launched), @"killed": @(killed), @"launched": @(launched), @"frida": @NO,
-                       @"note": launched ? @"已重启(uiopen 普通启动)" : (killed ? @"已结束但启动失败(权限?手动打开)" : @"未在运行,尝试启动失败") });
+                       @"note": launched ? (hasJs ? @"已重启(uiopen;frida 未就绪,未注入)" : @"已重启(uiopen 普通启动)") : (killed ? @"已结束但启动失败(权限?手动打开)" : @"未在运行,尝试启动失败") });
         return;
     }
     // 保持前台:单值目标(bundle 空=关闭)。独立于注入名单;监控线程按 suspend_count 判定 + uiopen 拉前台。
@@ -988,8 +1006,12 @@ static void *fgKeepThread(void *arg) {
                 int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
                 NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
                 if (pid == 0) {
-                    aggLog([NSString stringWithFormat:@"[fg-keep] %@ 已退出,拉起", bundle]);
-                    dh_undim_screen(); launchAppSmart(bundle); bgSince = 0;   // 配了 JS+frida 则 frida spawn 注入,否则 uiopen
+                    dh_undim_screen();
+                    if (launchAppSmart(bundle))
+                        aggLog([NSString stringWithFormat:@"[fg-keep] %@ 已退出,拉起", bundle]);
+                    else   // 配了 JS 但 frida 未就绪:不用无 frida 方式占位启动,下轮(pid 仍 0)自动重试,frida 就绪后 spawn 注入
+                        aggLog([NSString stringWithFormat:@"[fg-keep] %@ 已退出,frida 未就绪,等待重试", bundle]);
+                    bgSince = 0;
                 } else {
                     int sc = dh_task_suspend_count(pid);
                     if (sc == 0) { bgSince = 0; }              // 前台/活跃
