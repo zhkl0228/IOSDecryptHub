@@ -759,8 +759,8 @@ extern void dh_agg_http_start(void);   // 聚合历史查询 HTTP 服务(collect
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    { pthread_t mbt; if (pthread_create(&mbt, NULL, mem_bridge_manager, NULL) == 0) pthread_detach(mbt); }
-    dh_agg_http_start();   // 聚合口(8089):索引页 + per-daemon 历史重建(死 daemon 仍可富查询)
+    dh_agg_http_start();   // 最先起:同步 bind :8089(面板端口第一时间就绪,不被内存桥扫描慢活挡在后面)
+    { pthread_t mbt; if (pthread_create(&mbt, NULL, mem_bridge_manager, NULL) == 0) pthread_detach(mbt); }   // 内存桥(慢)挪到 :8089 之后
     unlink(DH_BRIDGE_SOCK);
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ls < 0) { logts("[collector] socket 失败 errno=%d", errno); return 1; }

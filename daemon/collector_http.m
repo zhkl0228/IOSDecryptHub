@@ -965,23 +965,16 @@ static void *connThread(void *arg) {
     close(fd);
     return NULL;
 }
-static void *aggThread(void *arg) {
+static int g_agg_ls = -1;   // agg HTTP 监听 socket(dh_agg_http_start 同步 bind,accept 在下面线程)
+static void *aggAcceptThread(void *arg) {
     (void)arg;
-    int ls = socket(AF_INET, SOCK_STREAM, 0);
-    if (ls < 0) { aggLog(@"[agg] socket 失败"); return NULL; }
-    int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET; sa.sin_port = htons(AGG_PORT); sa.sin_addr.s_addr = INADDR_ANY;
-    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0) { aggLog([NSString stringWithFormat:@"[agg] bind :%d 失败 errno=%d", AGG_PORT, errno]); close(ls); return NULL; }
-    if (listen(ls, 32) != 0) { aggLog(@"[agg] listen 失败"); close(ls); return NULL; }
-    aggLog([NSString stringWithFormat:@"[agg] 聚合历史查询 HTTP 于 *:%d(索引页 / + per-daemon /d/<proc>/)", AGG_PORT]);
     for (;;) {
-        int c = accept(ls, NULL, NULL);
+        int c = accept(g_agg_ls, NULL, NULL);
         if (c < 0) { if (errno == EINTR) continue; break; }
         pthread_t th; if (pthread_create(&th, NULL, connThread, (void *)(long)c) == 0) pthread_detach(th);
         else close(c);
     }
-    close(ls);
+    close(g_agg_ls);
     return NULL;
 }
 
@@ -1032,8 +1025,17 @@ static void *fgKeepThread(void *arg) {
 }
 
 void dh_agg_http_start(void) {
-    pthread_t th;
-    if (pthread_create(&th, NULL, aggThread, NULL) == 0) pthread_detach(th);
-    pthread_t fg;
-    if (pthread_create(&fg, NULL, fgKeepThread, NULL) == 0) pthread_detach(fg);   // 保持前台监控
+    // 同步 bind+listen:返回时 :8089 已可连(不等内存桥等慢活)。collector main 里最先调它,
+    // 保证重启后面板端口第一时间就绪——之前放线程里被内存桥(扫严格 daemon+task_for_pid)抢占,晚 ~9s+。
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) { aggLog(@"[agg] socket 失败"); return; }
+    int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_port = htons(AGG_PORT); sa.sin_addr.s_addr = INADDR_ANY;
+    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0) { aggLog([NSString stringWithFormat:@"[agg] bind :%d 失败 errno=%d", AGG_PORT, errno]); close(ls); return; }
+    if (listen(ls, 32) != 0) { aggLog(@"[agg] listen 失败"); close(ls); return; }
+    g_agg_ls = ls;
+    aggLog([NSString stringWithFormat:@"[agg] 聚合历史查询 HTTP 于 *:%d 已就绪(索引页 / + per-daemon /d/<proc>/)", AGG_PORT]);
+    pthread_t th; if (pthread_create(&th, NULL, aggAcceptThread, NULL) == 0) pthread_detach(th);
+    pthread_t fg; if (pthread_create(&fg, NULL, fgKeepThread, NULL) == 0) pthread_detach(fg);   // 保持前台监控
 }

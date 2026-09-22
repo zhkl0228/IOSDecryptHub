@@ -495,6 +495,8 @@ printf '%s\n' \
     '</array>' \
     '<key>RunAtLoad</key><true/>' \
     '<key>KeepAlive</key><true/>' \
+    '<key>ProcessType</key><string>Interactive</string>' \
+    '<key>LowPriorityIO</key><false/>' \
     '<key>StandardOutPath</key><string>/var/log/iosdecrypthub-collector.log</string>' \
     '<key>StandardErrorPath</key><string>/var/log/iosdecrypthub-collector.log</string>' \
     '</dict></plist>' > "\$COLLECTOR_PLIST"
