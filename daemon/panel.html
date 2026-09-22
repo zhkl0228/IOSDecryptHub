@@ -70,6 +70,7 @@ function pidCell(pid){return pid>0 ? '<span class="n">'+pid+'</span>' : '<span c
 async function loadD(){
   var a;
   try{ a = await (await fetch("/api/control/list?kind=daemon")).json(); }catch(e){ return; }
+  a.sort(function(x,y){ var r=function(d){return d.state=="live"?0:(d.enabled?1:(d.state=="dead"?3:2));}; return r(x)-r(y); });   // 1.有引擎(live) 2.开关已开 3.idle 4.dead
   var h = '<table><tr><th>进程</th><th>PID</th><th>注入</th><th>状态</th><th>引擎</th><th>捕获</th><th>操作</th></tr>';
   a.forEach(function(d){
     var sc = d.state=="live"?"on":(d.state=="idle"?"idle":"off");
@@ -134,6 +135,10 @@ function renderA(){
   var f = document.getElementById("af");
   var kw = (f ? f.value : "").trim().toLowerCase();
   var list = _apps.filter(function(x){ return !kw || (x.name+" "+x.bundle).toLowerCase().indexOf(kw)>=0; });
+  list.sort(function(x,y){
+    var rank=function(a){ return a.keepFg?0 : (a.injected?1 : (a.enabled?2 : (a.running?3:4))); };   // 0.保持前台 1.有引擎 2.开关已开 3.运行中 4.其余
+    return rank(x)-rank(y);   // 同类保持原序(用户 App 前、系统后、名字序)
+  });
   document.getElementById("acnt").textContent = list.length+" 个";
   var h = '<table><tr><th>App</th><th>PID</th><th>保持前台</th><th>注入</th><th>运行</th><th>引擎</th><th>操作</th></tr>';
   list.forEach(function(x){
