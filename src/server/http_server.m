@@ -37,6 +37,8 @@
 #import "dh_log_json.h"
 #import "mcp_server.h"
 #import "hook_network.h"
+#import <sys/un.h>          // sockaddr_un(daemon UDS 直连模式)
+#import "dh_bridge.h"       // collector 桥接协议:daemon 模式引擎自 connect-out collector,替代 companion 的 bind/listen/accept inline hook
 
 #define DH_HTTP_PORT_FIRST  8088
 #define DH_HTTP_PORT_LAST   8108
@@ -54,6 +56,11 @@ static NSString  *gURL      = nil;
 static dispatch_queue_t gAcceptQ = NULL;
 static dispatch_queue_t gWorkerQ = NULL;
 static dispatch_semaphore_t gConcurrency = NULL;  // 限制同时处理的连接数, 防 slow-client 耗尽 fd
+
+// daemon UDS 直连模式(companion 通过 dh_engine_set_daemon_uds 设):非空 = 不本地 bind, 改循环 connect-out
+// collector 的 UNIX socket serve(普通白名单 daemon, sandbox 放行 AF_UNIX 出站)。空 = 本地 bind(App/trollstore)。
+static char g_daemon_uds[128]          = {0};
+static char g_daemon_proc[DH_PROC_MAX] = {0};
 
 #define DH_HTTP_MAX_CONCURRENCY 8
 
@@ -1012,9 +1019,73 @@ static void accept_loop(void) {
     }
 }
 
+// —— daemon UDS 直连模式(替代 companion 的 bind/listen/accept inline hook)——
+// companion 在 dlopen 引擎**前** setenv(DH_DAEMON_UDS_SOCK / DH_DAEMON_UDS_PROC)告知,引擎 dh_http_start
+// 从环境变量读(见下,env 先于本 constructor 无竞态);普通白名单 daemon 用,App/trollstore 不设 env 走本地 bind。
+
+// 建一条到 collector 的 DATA 连接:connect UNIX socket + 发 dh_bridge_hdr + 阻塞读 GO(懒握手——
+// collector 只在有 LAN 客户端要 splice 时才发 GO,否则引擎空转会把连接池洪泛)。收到 GO=马上有真实
+// HTTP 请求进来,返回 fd 交 handle_connection(与本地 accept 的 fd 等价:引擎照常读请求/serve)。
+static int dh_uds_connect_data(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    dh_net_mark_internal_fd(fd);
+    struct sockaddr_un u; memset(&u, 0, sizeof u);
+    u.sun_family = AF_UNIX;
+    strncpy(u.sun_path, g_daemon_uds, sizeof u.sun_path - 1);
+    if (connect(fd, (struct sockaddr *)&u, sizeof u) != 0) { close(fd); return -1; }
+    struct dh_bridge_hdr h; memset(&h, 0, sizeof h);
+    h.magic = DH_BRIDGE_MAGIC; h.type = DH_CONN_DATA; h.pid = (uint32_t)getpid();
+    strncpy(h.proc, g_daemon_proc, sizeof h.proc - 1);
+    if (write(fd, &h, sizeof h) != (ssize_t)sizeof h) { close(fd); return -1; }
+    uint8_t go = 0;
+    if (read(fd, &go, 1) != 1 || go != DH_BRIDGE_GO) { close(fd); return -1; }
+    return fd;
+}
+
+// daemon UDS accept 循环:每轮建一条 DATA 连接(收到 GO 才回)→ 交 worker serve。等价本地 accept_loop,
+// 只是"连接来源"从内核 accept 换成主动 connect collector(sandbox 禁 inbound bind、放行 outbound connect)。
+static void dh_uds_accept_loop(void) {
+    while (1) {
+        int fd = dh_uds_connect_data();
+        if (fd < 0) { usleep(200 * 1000); continue; }   // collector 未起/被拒:退避重试(不洪泛)
+        dispatch_semaphore_wait(gConcurrency, DISPATCH_TIME_FOREVER);
+        dispatch_async(gWorkerQ, ^{
+            handle_connection(fd);
+            dispatch_semaphore_signal(gConcurrency);
+        });
+    }
+}
+
 void dh_http_start(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        // daemon UDS 模式从环境变量读:companion 在 dlopen 引擎**前** setenv,先于本 constructor 的
+        // dispatch_async(dh_http_start),无"晚设 vs 本函数被并发队列先执行"的竞态。
+        if (!g_daemon_uds[0]) {
+            const char *es = getenv("DH_DAEMON_UDS_SOCK");
+            if (es && *es) {
+                strncpy(g_daemon_uds, es, sizeof g_daemon_uds - 1);
+                const char *ep = getenv("DH_DAEMON_UDS_PROC");
+                if (ep && *ep) strncpy(g_daemon_proc, ep, sizeof g_daemon_proc - 1);
+            }
+        }
+        // worker 队列 + accept 队列 + 并发闸:两种传输模式共用
+        gWorkerQ = dispatch_queue_create("com.decrypthelper.http.worker", DISPATCH_QUEUE_CONCURRENT);
+        gConcurrency = dispatch_semaphore_create(DH_HTTP_MAX_CONCURRENCY);
+        gAcceptQ = dispatch_queue_create("com.decrypthelper.http.accept", DISPATCH_QUEUE_SERIAL);
+
+        if (g_daemon_uds[0]) {
+            // daemon UDS 直连模式:不本地 bind(sandbox 禁 inbound bind),循环 connect-out collector serve;
+            // gPort=0(无本地端口,collector 反代出 LAN 端口)。
+            gPort = 0;
+            dispatch_async(gAcceptQ, ^{ dh_uds_accept_loop(); });
+            dh_health_http_ok();
+            NSLog(@"[IOSDecryptHub] HTTP daemon UDS 直连模式(collector 反代): %s -> %s", g_daemon_proc, g_daemon_uds);
+            return;
+        }
+
+        // 本地 bind 模式(App/trollstore/未设 UDS):监听 8088..8108
         for (uint16_t p = DH_HTTP_PORT_FIRST; p <= DH_HTTP_PORT_LAST; p++) {
             int fd = try_bind(p);
             if (fd >= 0) { gListenFD = fd; gPort = p; break; }
@@ -1026,9 +1097,6 @@ void dh_http_start(void) {
         }
         NSString *ip = get_local_ip();
         gURL = [NSString stringWithFormat:@"http://%@:%u/", ip, (unsigned)gPort];
-        gAcceptQ = dispatch_queue_create("com.decrypthelper.http.accept", DISPATCH_QUEUE_SERIAL);
-        gWorkerQ = dispatch_queue_create("com.decrypthelper.http.worker", DISPATCH_QUEUE_CONCURRENT);
-        gConcurrency = dispatch_semaphore_create(DH_HTTP_MAX_CONCURRENCY);
         dispatch_async(gAcceptQ, ^{ accept_loop(); });
         dh_health_http_ok();
         NSLog(@"[IOSDecryptHub] HTTP 服务已启动: %@", gURL);

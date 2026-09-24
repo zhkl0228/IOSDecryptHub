@@ -15,7 +15,9 @@
 #define DH_HTTP_SERVER_H
 #import <Foundation/Foundation.h>
 
-// 启动服务, 自动选 8088..8108 第一个空闲端口
+// 启动服务:companion 在 dlopen 引擎前 setenv(DH_DAEMON_UDS_SOCK / DH_DAEMON_UDS_PROC)则走 daemon
+// UDS 直连模式(connect-out collector,替代 companion socket inline hook);否则本地 bind 8088..8108
+// 第一个空闲端口(App/trollstore)。
 void      dh_http_start(void);
 // 返回成功绑定的端口, 0 表示未启动
 uint16_t  dh_http_port(void);

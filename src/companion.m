@@ -172,20 +172,9 @@ static int dh_mem_accept(void) {
     return sv[0];   // 引擎用真 socketpair fd
 }
 static int my_accept(int s, struct sockaddr *a, socklen_t *l) {
-    if (s == g_engine_fd) {
-        if (g_mem_bridge) return dh_mem_accept();
-        // socket 桥懒连接:开一条 DATA 连接后**阻塞**读 collector 的 go(见 dh_bridge.h)。
-        int fd = dh_connect(DH_CONN_DATA);
-        if (fd < 0) { errno = ECONNABORTED; return -1; }
-        char go = 0;
-        ssize_t r = read(fd, &go, 1);
-        if (r != 1 || (unsigned char)go != DH_BRIDGE_GO) {
-            close(fd);
-            errno = ECONNABORTED;
-            return -1;
-        }
-        return fd;
-    }
+    // 本 hook 只严格 daemon 内存桥装(见 dh_img_added:socket hook 仅 g_mem_bridge);普通 daemon 走引擎
+    // UDS 直连、不装本 hook。故命中引擎监听 fd 必走内存桥的 socketpair。
+    if (s == g_engine_fd) return dh_mem_accept();
     return real_accept ? real_accept(s, a, l) : -1;
 }
 
@@ -493,10 +482,13 @@ static void dh_img_added(const struct mach_header *mh, intptr_t slide) {
     Dl_info info;
     if (dladdr(mh, &info) == 0 || !info.dli_fname) return;
     if (!strstr(info.dli_fname, "decrypt_helper")) return;
-    dh_install_socket_hooks();
+    // socket hook 只严格 daemon 内存桥需要(拦引擎 bind/accept 转 socketpair);普通 daemon 走引擎 UDS
+    // 直连、引擎不本地 bind,无需 hook。health/swizzle 两者都要且趁早(引擎镜像载入、constructor 前),
+    // 拦得住引擎最初几条落盘失败与 _persist——这一步早装正是消除普通 daemon"落盘失败"红条的关键。
+    if (g_mem_bridge) dh_install_socket_hooks();
     dh_install_health_hooks();
     dh_swizzle_logstore();
-    syslog(LOG_NOTICE, TAG " 已装 socket/日志 hook(引擎镜像载入)");
+    syslog(LOG_NOTICE, TAG " 已装 %s日志 hook(引擎镜像载入)", g_mem_bridge ? "socket/" : "");
 }
 
 // —— 自检 ——
@@ -582,9 +574,16 @@ static void dh_companion_init(void) {
         pthread_t th;   // socket 桥:常驻 control 报活体
         if (pthread_create(&th, NULL, dh_control_thread, NULL) == 0) pthread_detach(th);
 
-        // socket 桥:能读 config,自己判断是否已开启并架桥
+        // 普通 daemon(sandbox 放行 AF_UNIX 出站):能读 config,自己判断是否已开启并架桥。引擎自己
+        // connect-out collector(UDS 直连),companion 不 hook bind/listen/accept。用环境变量在 dlopen **前**
+        // 告知——先于引擎 constructor 里 dispatch_async 的 dh_http_start,无竞态。引擎与 companion 同批
+        // 部署、一定认 env,不做旧引擎回退。
         if (dh_enabled(g_proc)) {
-            syslog(LOG_NOTICE, TAG " %s 已启用,架桥载引擎(socket 桥)", g_proc);
+            syslog(LOG_NOTICE, TAG " %s 已启用,载引擎(UDS 直连)", g_proc);
+            setenv("DH_DAEMON_UDS_SOCK", DH_BRIDGE_SOCK, 1);
+            setenv("DH_DAEMON_UDS_PROC", g_proc, 1);
+            // 早注册镜像回调:引擎镜像载入即装 health/swizzle(拦早期落盘失败与最初几条 _persist);
+            // 普通 daemon 的 dh_img_added 不装 socket hook(见其内 g_mem_bridge 判断)。
             _dyld_register_func_for_add_image(dh_img_added);
             void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
             syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");

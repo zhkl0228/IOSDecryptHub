@@ -40,7 +40,11 @@
 extern kern_return_t task_for_pid(mach_port_t target, int pid, mach_port_t *task);
 
 #define MAX_TARGETS   32
-#define LAN_PORT_BASE 8090
+// collector 反代 slot 起点。**必须避开引擎本地 bind 范围 8088-8108**(src/server/http_server.m
+// DH_HTTP_PORT_FIRST..LAST):App 走 loader 本地 bind、引擎从 8088 递增,会占到 8090+,与反代 slot 撞
+// (实测 AppStore 引擎 bind 8090 占死 nsurlsessiond 反代 slot → collector bind EADDRINUSE、连不上)。
+// 故上移到 8200,给 14 个白名单 daemon 留 8200-8213,远离引擎范围。
+#define LAN_PORT_BASE 8200
 #define POOL_MAX      16
 
 typedef struct {
@@ -221,6 +225,8 @@ static void *control_reader(void *arg) {
     pthread_mutex_lock(&t->lock);
     while (t->pool_n > 0) close(t->pool[--t->pool_n]);
     pthread_mutex_unlock(&t->lock);
+    // 注:socket 桥的 lan_fd(LAN 监听)**跨 daemon 重启保持复用**——target 按 proc 名常驻,lan_thread 一直
+    // accept 反代端口,daemon 换 pid 只是换池中 DATA 连接,不重建监听(故无内存桥那种重建 bind 竞态)。
     logts("[collector] %s 下线", t->proc);
     return NULL;
 }
