@@ -11,8 +11,14 @@
 #import <mach/mach.h>
 #import <pthread.h>
 #import <errno.h>
+#import <unistd.h>       // write/close(daemon UDS emit)
+#import "dh_bridge.h"    // DH_CONN_CAP/DH_CONN_LOG(daemon 模式引擎源码级自 emit cap/log)
 #include <stdio.h>
 #include <stdlib.h>
+
+// http_server.m 导出:daemon UDS 直连模式下建到 collector 的桥接连接(引擎源码级 emit,替代 companion swizzle)。
+extern int dh_daemon_uds_connect(uint8_t type);
+extern int dh_daemon_uds_active(void);
 
 @implementation DHLogEntry
 @end
@@ -657,6 +663,17 @@ static NSMutableString *dh_entry_block(DHLogEntry *e) {
 
 // 建立/恢复常开 append 句柄 (须在 _queue 内 + dh_in_hook 已置位)。文件不存在则创建。
 - (void)_openLogHandleLocked {
+    // daemon UDS 模式:flat log 走 collector(引擎源码级自 emit,替代 companion swizzle _openLogHandleLocked)。
+    // _logFH = 一条 DH_CONN_LOG 连接的句柄;写失败(socket 断)由 _flushLocked 关 _logFH→下批重开=重连。
+    // daemon sandbox 写不了本地文件,连不上就本批丢、下批重试(不回退本地)。
+    if (dh_daemon_uds_active()) {
+        int fd = dh_daemon_uds_connect(DH_CONN_LOG);
+        if (fd >= 0) {
+            _logFH = [[NSFileHandle alloc] initWithFileDescriptor:fd closeOnDealloc:YES];
+            _logBytes = 0;
+        }
+        return;
+    }
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:_filePath]) {
         [fm createFileAtPath:_filePath contents:nil attributes:nil];
@@ -671,6 +688,7 @@ static NSMutableString *dh_entry_block(DHLogEntry *e) {
 
 // 滚动归档 (须在 _queue 内 + dh_in_hook 已置位): 删最旧 .3, 依次 .2→.3 / .1→.2 / 当前→.1, 下次写入重建当前段。
 - (void)_rotateLocked {
+    if (dh_daemon_uds_active()) return;   // daemon 模式 log 走 socket(collector 侧落盘/管理),不做本地滚动归档
     [_logFH closeFile]; _logFH = nil;
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtPath:[self _segPath:kMaxRotatedBackups] error:nil];
@@ -713,7 +731,54 @@ static NSMutableString *dh_entry_block(DHLogEntry *e) {
     }
 }
 
+// 把一条 DHLogEntry 序列化成 collector 认的 cap.jsonl 一行(长键 base64,与原 companion dh_cap_emit 同格式)。
+// **单一序列化源**:daemon UDS 模式引擎自 emit 用它;严格 daemon 的 companion swizzle 也 dlsym 它推 cap_ring。
+// 导出(companion dlsym)。
+NSData *dh_cap_serialize(DHLogEntry *e) {
+    if (!e) return nil;
+    NSData *in = e.input, *out = e.output;
+    NSUInteger inLen = in ? in.length : 0, outLen = out ? out.length : 0;
+    const NSUInteger CAP = 8192;
+    NSString *inB64  = in  ? [[in  subdataWithRange:NSMakeRange(0, MIN(inLen,  CAP))] base64EncodedStringWithOptions:0] : @"";
+    NSString *outB64 = out ? [[out subdataWithRange:NSMakeRange(0, MIN(outLen, CAP))] base64EncodedStringWithOptions:0] : @"";
+    id cs = e.callStack;
+    NSString *csStr = [cs isKindOfClass:[NSArray class]]  ? [(NSArray *)cs componentsJoinedByString:@"\n"]
+                    : [cs isKindOfClass:[NSString class]] ? (NSString *)cs
+                    : (cs ? [cs description] : @"");
+    NSMutableDictionary *rec = [@{
+        @"seq": @(e.seq), @"cat": @(e.category),
+        @"algo": (e.algorithm ?: @""), @"op": (e.operation ?: @""), @"detail": (e.detail ?: @""),
+        @"inLen": @(inLen), @"outLen": @(outLen), @"in": inB64, @"out": outB64,
+        @"cs": csStr, @"tsMs": @(e.timestampMs), @"tid": @(e.threadId),
+    } mutableCopy];
+    NSData *key = e.key, *iv = e.iv; NSString *pki = e.publicKeyInfo;
+    if (key.length) rec[@"key"] = [[key subdataWithRange:NSMakeRange(0, MIN(key.length, CAP))] base64EncodedStringWithOptions:0];
+    if (iv.length)  rec[@"iv"]  = [[iv  subdataWithRange:NSMakeRange(0, MIN(iv.length,  CAP))] base64EncodedStringWithOptions:0];
+    if (pki.length) rec[@"pki"] = pki;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
+    if (!json) return nil;
+    NSMutableData *line = [NSMutableData dataWithData:json];
+    [line appendBytes:"\n" length:1];
+    return line;
+}
+
+// daemon UDS 模式:引擎自己把这条 cap emit 到 collector(持久 CAP 连接,写失败关 fd 下次重连、这条丢)。
+// 只在 _persist(引擎串行 _queue)内调用,g_cap_emit_fd 无需锁。普通 daemon 走这条;严格 daemon 非 UDS 模式
+// (dh_daemon_uds_active()=0),cap 由 companion swizzle + dh_cap_serialize 推 cap_ring,不走这里。
+static int g_cap_emit_fd = -1;
+static void dh_cap_emit_daemon(DHLogEntry *e) {
+    if (!dh_daemon_uds_active()) return;
+    NSData *line = dh_cap_serialize(e);
+    if (!line.length) return;
+    if (g_cap_emit_fd < 0) g_cap_emit_fd = dh_daemon_uds_connect(DH_CONN_CAP);
+    if (g_cap_emit_fd < 0) return;
+    if (write(g_cap_emit_fd, line.bytes, (size_t)line.length) != (ssize_t)line.length) {
+        close(g_cap_emit_fd); g_cap_emit_fd = -1;
+    }
+}
+
 - (void)_persist:(DHLogEntry *)e noisy:(BOOL)noisy {
+    dh_cap_emit_daemon(e);   // daemon UDS 模式:引擎源码级 emit cap 到 collector(非 daemon 模式为 no-op)
     NSMutableString *s = dh_entry_block(e);
     NSData *bytes = [s dataUsingEncoding:NSUTF8StringEncoding];
     if (!bytes) { DH_ERR(@"日志 UTF-8 编码失败, 丢弃 #%llu", (unsigned long long)e.seq); return; }

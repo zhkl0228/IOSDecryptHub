@@ -6,6 +6,16 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdlib.h>   // getenv
+
+// 引擎是否在系统 daemon 环境:companion 经环境变量 DH_DAEMON 告知(普通 + 严格 daemon 都 setenv;App/
+// trollstore 不设)。引擎据此**源码级**调整 daemon 专属行为(落盘失败不报健康故障、不建悬浮窗),替代
+// companion 原来对 dh_health_persist_fail/dh_diag_append 的 inline hook 与对 DHFloatingController 的 swizzle。
+int dh_daemon_env(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (getenv("DH_DAEMON") != NULL) ? 1 : 0;
+    return cached;
+}
 
 static atomic_uint g_hook_fails     = 0;
 static atomic_int  g_persist_failed = 0;
@@ -81,6 +91,8 @@ static void diag_persist_line(int board, const char *line) {
 }
 
 void dh_diag_append(int board, const char *level, const char *msg) {
+    // daemon 环境:滤掉落盘失败类诊断(数据走 collector,不是故障)——替代 companion 原来对本函数的 inline hook。
+    if (dh_daemon_env() && msg && (strstr(msg, "落盘失败") || strstr(msg, "无法打开"))) return;
     if (board < 0 || board >= DH_DIAG_BOARD_COUNT) board = DH_DIAG_GENERAL;
     char ts[16];
     time_t now = time(NULL);
@@ -163,6 +175,7 @@ void dh_health_hook_fail(int board, const char *sym) {
 }
 
 void dh_health_persist_fail(int err) {
+    if (dh_daemon_env()) return;   // daemon 环境:落盘失败是预期(数据走 collector,非本地文件),不报健康故障
     atomic_store(&g_persist_failed, 1);
     atomic_store(&g_persist_errno, err);
     char m[64]; snprintf(m, sizeof(m), "日志落盘失败 errno=%d", err);

@@ -46,6 +46,10 @@ typedef enum {
 // 直接放行不记录, 防止递归死锁。
 extern __thread int dh_in_hook;
 
+// 是否运行在系统 daemon 环境(companion 注入时 setenv DH_DAEMON=1)。首次调用缓存。
+// 用于让引擎自身按环境调整行为(落盘失败不算故障、不建悬浮窗等),替代 companion 外部打 patch。
+int dh_daemon_env(void);
+
 // ---- 上报失效 ----
 void dh_health_hook_fail(int board, const char *sym);  // 某符号没挂上, 归到 board 板块诊断
 void dh_health_persist_fail(int err);           // 日志落盘失败 (errno)

@@ -1023,10 +1023,11 @@ static void accept_loop(void) {
 // companion 在 dlopen 引擎**前** setenv(DH_DAEMON_UDS_SOCK / DH_DAEMON_UDS_PROC)告知,引擎 dh_http_start
 // 从环境变量读(见下,env 先于本 constructor 无竞态);普通白名单 daemon 用,App/trollstore 不设 env 走本地 bind。
 
-// 建一条到 collector 的 DATA 连接:connect UNIX socket + 发 dh_bridge_hdr + 阻塞读 GO(懒握手——
-// collector 只在有 LAN 客户端要 splice 时才发 GO,否则引擎空转会把连接池洪泛)。收到 GO=马上有真实
-// HTTP 请求进来,返回 fd 交 handle_connection(与本地 accept 的 fd 等价:引擎照常读请求/serve)。
-static int dh_uds_connect_data(void) {
+// 建一条到 collector 的桥接连接:connect UNIX socket + 发 dh_bridge_hdr(type),不读 GO(持久推送用,
+// 如 CAP/LOG)。供 log_store 的 daemon 模式 cap/log 自 emit 复用(引擎源码级,不再靠 companion swizzle)。
+// 失败返回 -1。DATA 的懒握手 GO 由 dh_uds_connect_data 额外读。
+int dh_daemon_uds_connect(uint8_t type) {
+    if (!g_daemon_uds[0]) return -1;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     dh_net_mark_internal_fd(fd);
@@ -1035,9 +1036,20 @@ static int dh_uds_connect_data(void) {
     strncpy(u.sun_path, g_daemon_uds, sizeof u.sun_path - 1);
     if (connect(fd, (struct sockaddr *)&u, sizeof u) != 0) { close(fd); return -1; }
     struct dh_bridge_hdr h; memset(&h, 0, sizeof h);
-    h.magic = DH_BRIDGE_MAGIC; h.type = DH_CONN_DATA; h.pid = (uint32_t)getpid();
+    h.magic = DH_BRIDGE_MAGIC; h.type = type; h.pid = (uint32_t)getpid();
     strncpy(h.proc, g_daemon_proc, sizeof h.proc - 1);
     if (write(fd, &h, sizeof h) != (ssize_t)sizeof h) { close(fd); return -1; }
+    return fd;
+}
+
+// 引擎是否处于 daemon UDS 直连模式(companion 经 env 告知)。log_store 据此决定 cap/log 是否自 emit。
+int dh_daemon_uds_active(void) { return g_daemon_uds[0] != 0; }
+
+// DATA 连接:通用连接 + 阻塞读 GO(懒握手——collector 只在有 LAN 客户端要 splice 时才发 GO,否则引擎
+// 空转会把连接池洪泛)。收到 GO=马上有真实 HTTP 请求,返回 fd 交 handle_connection(与本地 accept 等价)。
+static int dh_uds_connect_data(void) {
+    int fd = dh_daemon_uds_connect(DH_CONN_DATA);
+    if (fd < 0) return -1;
     uint8_t go = 0;
     if (read(fd, &go, 1) != 1 || go != DH_BRIDGE_GO) { close(fd); return -1; }
     return fd;

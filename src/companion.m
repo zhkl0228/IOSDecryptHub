@@ -282,78 +282,25 @@ static void dh_cap_push(const uint8_t *data, uint32_t n) {
     pthread_mutex_unlock(&g_cap_lock);
 }
 
-// socket 桥(普通 daemon):把一行捕获 JSON 推给 collector 的 DH_CONN_CAP 连接,collector 落
-// /var/log/dh-<proc>.cap.jsonl(与内存桥同文件)。懒连接;写失败即关 fd 下次重连(这条丢,尽力聚合)。
-// fd 由 dh_connect 标记为内部,免被引擎网络 hook 当成 daemon 网络活动捕获。
-static int g_cap_fd = -1;
-static pthread_mutex_t g_cap_sock_lock = PTHREAD_MUTEX_INITIALIZER;
-static void dh_cap_sock_write(const uint8_t *data, uint32_t n) {
-    pthread_mutex_lock(&g_cap_sock_lock);
-    if (g_cap_fd < 0) g_cap_fd = dh_connect(DH_CONN_CAP);
-    if (g_cap_fd >= 0) {
-        uint32_t off = 0;
-        while (off < n) {
-            ssize_t w = write(g_cap_fd, data + off, n - off);
-            if (w <= 0) { close(g_cap_fd); g_cap_fd = -1; break; }
-            off += (uint32_t)w;
+// 引擎导出的序列化(dlsym dh_cap_serialize):DHLogEntry → 一行 cap.jsonl JSON(NSData*)。**单一格式源**
+// 在引擎 log_store.m。严格 daemon swizzle 后用它序列化 → 推 cap_ring(collector vm_read);普通 daemon 由
+// 引擎源码级自 emit(log_store dh_cap_emit_daemon,直接 connect collector),不经 companion——故 socket 桥
+// 的 dh_cap_sock_write 已废除。
+static NSData *(*dh_cap_serialize_fn)(id) = NULL;
+
+// swizzle 引擎 **_persist:noisy:**(双参!——引擎方法签名是 _persist:noisy:;旧代码 swizzle 单参 _persist:
+// 会 selector 失配、装不上,引擎源码化后暴露)。_persist 在引擎串行队列、setSeq: 之后被调(seq 已就绪、
+// 彼此串行)。**仅严格 daemon(内存桥)装**:先让引擎正常落盘(flat/WebUI 照旧),再用引擎 dh_cap_serialize
+// 序列化推 cap_ring(严格 daemon 引擎 connect 不出去,只能 companion 代推)。普通 daemon 不装(引擎自 emit)。
+static void (*orig_persist)(id, SEL, id, BOOL);
+static void my_persist(id self, SEL _cmd, id entryObj, BOOL noisy) {
+    if (orig_persist) orig_persist(self, _cmd, entryObj, noisy);
+    if (dh_cap_serialize_fn && entryObj) {
+        @autoreleasepool {
+            NSData *line = dh_cap_serialize_fn(entryObj);
+            if (line.length) dh_cap_push(line.bytes, (uint32_t)line.length);
         }
     }
-    pthread_mutex_unlock(&g_cap_sock_lock);
-}
-
-// 序列化一条 DHLogEntry → 一行 JSON → cap_ring。my_append(流式)与 swizzle 时的 backlog 回填共用。
-// 存引擎原始 category 整数,不 clamp:引擎 dh_log_category_count()=9,名字表
-// {0 digest,1 hmac,2 sym,3 asym,4 file,5 sys,6 net,7 keychain,8 other},category_from_string
-// 未匹配返回 -1。名字映射(idx<=8 用表,否则 "other")照抄引擎、放 collector 重建层,这里只忠实
-// 记原值——否则日后引擎加类 / 出现 -1 会被静默折成 other,真值永久丢失(IDA 1.27.3 确认)。
-static void dh_cap_emit(id entryObj) {
-    if (!entryObj) return;
-    @autoreleasepool {
-        DHLogEntry *e = (DHLogEntry *)entryObj;
-        NSData *in = [e input]; NSData *out = [e output];
-        NSUInteger inLen = in ? in.length : 0, outLen = out ? out.length : 0;
-        const NSUInteger CAP = 8192;
-        NSString *inB64  = in  ? [[in  subdataWithRange:NSMakeRange(0, MIN(inLen,  CAP))] base64EncodedStringWithOptions:0] : @"";
-        NSString *outB64 = out ? [[out subdataWithRange:NSMakeRange(0, MIN(outLen, CAP))] base64EncodedStringWithOptions:0] : @"";
-        id cs = [e callStack];
-        NSString *csStr = [cs isKindOfClass:[NSArray class]]  ? [(NSArray *)cs componentsJoinedByString:@"\n"]
-                        : [cs isKindOfClass:[NSString class]] ? (NSString *)cs
-                        : (cs ? [cs description] : @"");
-        NSMutableDictionary *rec = [@{
-            @"seq": @([e seq]),
-            @"cat": @([e category]),
-            @"algo": ([e algorithm] ?: @""),
-            @"op": ([e operation] ?: @""),
-            @"detail": ([e detail] ?: @""),
-            @"inLen": @(inLen), @"outLen": @(outLen),
-            @"in": inB64, @"out": outB64,
-            @"cs": csStr,
-            @"tsMs": @([e timestampMs]),
-            @"tid": @([e threadId]),
-        } mutableCopy];
-        // crypto 料(key/iv/publicKeyInfo)——本 fork 分析核心,仅非空时写入以保持记录紧凑。
-        NSData *key = [e key]; NSData *iv = [e iv]; NSString *pki = [e publicKeyInfo];
-        if (key.length) rec[@"key"] = [[key subdataWithRange:NSMakeRange(0, MIN(key.length, CAP))] base64EncodedStringWithOptions:0];
-        if (iv.length)  rec[@"iv"]  = [[iv  subdataWithRange:NSMakeRange(0, MIN(iv.length,  CAP))] base64EncodedStringWithOptions:0];
-        if (pki.length) rec[@"pki"] = pki;
-        NSData *json = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
-        if (!json) return;
-        NSMutableData *line = [NSMutableData dataWithData:json];
-        [line appendBytes:"\n" length:1];
-        // 分流:严格 daemon(内存桥)写 cap_ring 由 collector vm_read;普通 daemon(socket 桥)推
-        // DH_CONN_CAP 由 collector 落盘。同一条 JSON-lines 格式,collector/聚合层统一处理。
-        if (g_mem_bridge) dh_cap_push(line.bytes, (uint32_t)line.length);
-        else              dh_cap_sock_write(line.bytes, (uint32_t)line.length);
-    }
-}
-
-// 挂 _persist: 而非 append::append: 跑在调用线程(可并发)且在 setSeq: 之前——那时读 [e seq] 恒为 0。
-// _persist: 在引擎串行队列上、setSeq: 之后被调用(IDA 1.27.3 确认:block_invoke 里先 ++seq/setSeq: 再
-// _persist:),此处 seq 已就绪且 _persist: 彼此串行。语义上它就是引擎落盘点,聚合挂这里最自然。
-static void (*orig_persist)(id, SEL, id);
-static void my_persist(id self, SEL _cmd, id entryObj) {
-    if (orig_persist) orig_persist(self, _cmd, entryObj);   // 先让引擎正常落盘(flat 日志/WebUI 照旧)
-    dh_cap_emit(entryObj);                                  // 两桥都聚合:dh_cap_emit 内按桥型分流
 }
 
 static void dh_swizzle_logstore(void) {
@@ -369,60 +316,32 @@ static void dh_swizzle_logstore(void) {
     }
     Method m2 = class_getInstanceMethod(cls, NSSelectorFromString(@"_rotateLocked"));
     if (m2) method_setImplementation(m2, (IMP)my_rotateLocked);
-    Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(@"_persist:"));   // 结构化捕获聚合
-    if (m3) {
-        orig_persist = (void (*)(id, SEL, id))method_getImplementation(m3);
+    // cap:引擎导出 dh_cap_serialize(单一格式源);swizzle **_persist:noisy:**(双参,引擎真实 selector——
+    // 旧代码 swizzle 单参 _persist: 会失配、装不上)。仅严格 daemon 装(dh_swizzle_logstore 只在 g_mem_bridge
+    // 分支调用;普通 daemon 引擎源码级自 emit)。
+    dh_cap_serialize_fn = (NSData *(*)(id))dlsym(RTLD_DEFAULT, "dh_cap_serialize");
+    Method m3 = class_getInstanceMethod(cls, NSSelectorFromString(@"_persist:noisy:"));
+    if (m3 && dh_cap_serialize_fn) {
+        orig_persist = (void (*)(id, SEL, id, BOOL))method_getImplementation(m3);
         method_setImplementation(m3, (IMP)my_persist);
-        // 回填 backlog:引擎在本 swizzle 装上之前(dlopen/init 期)已 persist 若干条(实测 mobileactivationd
-        // 启动即 5 条 sys),这些没经 _persist: 入口。短命 daemon 死后它们永久丢失,故这里一次性 snapshot
-        // 补进 cap_ring。带 seq,与流式的并集由 collector 重建层按 seq 去重(无损、确定)。仅内存桥(P1)。
-        if (g_mem_bridge) {
-            id store = ((id (*)(id, SEL))objc_msgSend)((id)cls, NSSelectorFromString(@"shared"));
-            id backlog = store ? ((id (*)(id, SEL))objc_msgSend)(store, NSSelectorFromString(@"snapshot")) : nil;
-            if ([backlog isKindOfClass:[NSArray class]]) {
-                for (id e in (NSArray *)backlog) dh_cap_emit(e);
-                syslog(LOG_NOTICE, TAG " swizzle _persist: + 回填 backlog %lu 条", (unsigned long)[(NSArray *)backlog count]);
-            }
+        // 回填 backlog:引擎在本 swizzle 装上之前(dlopen/init 期)已 persist 若干条(实测启动即 5 条 sys),
+        // 没经 _persist:noisy: 入口。短命 daemon 死后永久丢失,故一次性 snapshot 补进 cap_ring;带 seq,
+        // 与流式并集由 collector 重建层按 seq 去重(无损、确定)。
+        id store = ((id (*)(id, SEL))objc_msgSend)((id)cls, NSSelectorFromString(@"shared"));
+        id backlog = store ? ((id (*)(id, SEL))objc_msgSend)(store, NSSelectorFromString(@"snapshot")) : nil;
+        if ([backlog isKindOfClass:[NSArray class]]) {
+            for (id e in (NSArray *)backlog) { NSData *l = dh_cap_serialize_fn(e); if (l.length) dh_cap_push(l.bytes, (uint32_t)l.length); }
+            syslog(LOG_NOTICE, TAG " swizzle _persist:noisy: + 回填 backlog %lu 条", (unsigned long)[(NSArray *)backlog count]);
         }
+    } else {
+        syslog(LOG_NOTICE, TAG " swizzle _persist:noisy: 跳过(m3=%p serialize=%p)", (void *)m3, (void *)dh_cap_serialize_fn);
     }
-    syslog(LOG_NOTICE, TAG " 已重定向 DHLogStore 落盘 -> collector + swizzle _persist:(结构化捕获)");
+    syslog(LOG_NOTICE, TAG " 已重定向 DHLogStore 落盘 -> collector(严格 daemon 内存桥)");
 }
 
-// 引擎的悬浮窗(DHFloatingController)给 App 显示 ip:port;daemon 里没有可用的 UIWindowScene,
-// -[DHFloatingController createFloatingWindow] 落到 initWithFrame: 分支后,系统为无 scene 的
-// UIWindow 自建 UIWindowScene 会断言崩(实测 trustd 注入即 SIGABRT)。companion 只注入 daemon,
-// 故无条件把 -[DHFloatingController build] 置空——daemon 不需要悬浮窗;App 走 loader 注入不受影响。
-static void my_floating_build(id self, SEL _cmd) { (void)self; (void)_cmd; /* daemon 不建悬浮窗 */ }
-
-static void dh_disable_floating_window(void) {
-    static bool done = false;
-    if (done) return;
-    Class cls = NSClassFromString(@"DHFloatingController");
-    if (!cls) return;   // 类还没注册,等 dlopen 后那次兜底
-    Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"build"));
-    if (!m) return;
-    method_setImplementation(m, (IMP)my_floating_build);
-    done = true;
-    syslog(LOG_NOTICE, TAG " 已禁用引擎悬浮窗(daemon 无 UIScene,-[DHFloatingController build] 置空)");
-}
-
-// 用 ellekit 的 MSHookFunction(本项目已依赖 ellekit)对引擎两个**导出 C 函数**做 inline hook,
-// 从根上消除「落盘失败」——daemon sandbox 写不了文件、日志已改走 collector,这类报错没有意义:
-//   1) dh_health_persist_fail:纯 setter(atomic_store(1,&g_persist_failed)+fprintf+diag,见 IDA),
-//      no-op 它 → health 标志从不置真;
-//   2) dh_diag_append:所有 diag 事件的入口,只过滤掉含「落盘失败/无法打开」的条目(精确匹配,
-//      其余 diag 照常)→ diag 时间线不再出现落盘失败。
-// 为什么不 hook _persist:/_openLogHandleLocked —— 它们是 local 符号(dlsym 拿不到),只能等 ObjC
-// 类注册后 swizzle,赶不上构造函数里最初几次 _persist;而这两个是导出符号,dlsym 可达,能在构造
-// 函数**之前**(dh_img_added 时)就 hook 到,首次也拦得住。MSHookFunction 正确处理 arm64e 的
-// PAC/text 保护(手动 vm_protect 改 text 会 kr=1);按符号名定位,不依赖 offset。
-static void my_health_persist_fail(unsigned int err) { (void)err; /* no-op */ }
-
-static long (*orig_dh_diag_append)(int, const char *, const char *);
-static long my_dh_diag_append(int board, const char *level, const char *msg) {
-    if (msg && (strstr(msg, "落盘失败") || strstr(msg, "无法打开"))) return 0;  // 丢弃落盘失败类
-    return orig_dh_diag_append ? orig_dh_diag_append(board, level, msg) : 0;
-}
+// 落盘失败抑制不再靠 hook 引擎的 dh_health_persist_fail/dh_diag_append —— 引擎源码级 dh_daemon_env()
+// (companion 已 setenv DH_DAEMON=1)在这两个函数内自判 daemon 环境并 no-op/滤除,companion 不再介入。
+// 下面的 dh_get_mshook + socket inline hook 仅严格 daemon 内存桥仍需(重定向引擎 WebUI socket)。
 
 // 取 ellekit 的 MSHookFunction(substrate 兼容符号在 libellekit,libsubstrate 软链到它)。
 static void *dh_get_mshook(void) {
@@ -459,36 +378,23 @@ static void dh_install_socket_hooks(void) {
     syslog(LOG_NOTICE, TAG " 已 inline-hook bind/listen/accept(引擎 WebUI socket 重定向)");
 }
 
-static void dh_install_health_hooks(void) {
-    static bool done = false;
-    if (done) return;
-    void *pf = dlsym(RTLD_DEFAULT, "dh_health_persist_fail");
-    void *da = dlsym(RTLD_DEFAULT, "dh_diag_append");
-    if (!pf || !da) return;   // 符号未解析到,留给下次兜底
-    void (*MSHookFunction)(void *, void *, void **) =
-        (void (*)(void *, void *, void **))dh_get_mshook();
-    if (!MSHookFunction) { syslog(LOG_NOTICE, TAG " 无 MSHookFunction,health hook 未装"); return; }
-    MSHookFunction(pf, (void *)my_health_persist_fail, NULL);
-    MSHookFunction(da, (void *)my_dh_diag_append, (void **)&orig_dh_diag_append);
-    done = true;
-    syslog(LOG_NOTICE, TAG " 已 inline-hook dh_health_persist_fail + dh_diag_append(滤落盘失败)");
-}
-
-// 引擎镜像载入(构造函数之前)时触发:装 socket inline hook(赶在引擎 bind 前)、health hook、
-// 日志句柄 swizzle。socket hook 改用 inline(见 dh_install_socket_hooks:fishhook GOT 在 lockdownd
-// 会被引擎的 accept 调用绕过)。
+// 引擎镜像载入(构造函数之前)时触发:仅严格 daemon 内存桥装 socket inline hook(赶在引擎 bind 前)
+// + swizzle logstore。落盘失败/悬浮窗抑制已交给引擎源码级 dh_daemon_env(),不在此处 hook。
+// socket hook 用 inline(见 dh_install_socket_hooks:fishhook GOT 在 lockdownd 会被引擎的 accept 调用绕过)。
 static void dh_img_added(const struct mach_header *mh, intptr_t slide) {
     (void)slide;
     Dl_info info;
     if (dladdr(mh, &info) == 0 || !info.dli_fname) return;
     if (!strstr(info.dli_fname, "decrypt_helper")) return;
-    // socket hook 只严格 daemon 内存桥需要(拦引擎 bind/accept 转 socketpair);普通 daemon 走引擎 UDS
-    // 直连、引擎不本地 bind,无需 hook。health/swizzle 两者都要且趁早(引擎镜像载入、constructor 前),
-    // 拦得住引擎最初几条落盘失败与 _persist——这一步早装正是消除普通 daemon"落盘失败"红条的关键。
-    if (g_mem_bridge) dh_install_socket_hooks();
-    dh_install_health_hooks();
-    dh_swizzle_logstore();
-    syslog(LOG_NOTICE, TAG " 已装 %s日志 hook(引擎镜像载入)", g_mem_bridge ? "socket/" : "");
+    // 落盘失败/悬浮窗抑制已由引擎源码级 dh_daemon_env() 处理(companion 已 setenv DH_DAEMON=1),不再 hook。
+    // 严格 daemon 内存桥仍需趁早(引擎镜像载入、constructor 前)装 socket hook(拦引擎 bind/accept 转
+    // socketpair)+ swizzle logstore(把 cap/log 推内存桥 ring;严格 daemon 无 UDS 出站,引擎自 emit 不通)。
+    // 普通 daemon 走引擎 UDS 直连、不本地 bind、cap/log 引擎源码级自 emit,dh_img_added 无需做任何事。
+    if (g_mem_bridge) {
+        dh_install_socket_hooks();
+        dh_swizzle_logstore();
+        syslog(LOG_NOTICE, TAG " 已装 socket+swizzle(严格 daemon 内存桥,引擎镜像载入)");
+    }
 }
 
 // —— 自检 ——
@@ -545,7 +451,9 @@ static void *dh_mem_load_thread(void *arg) {
             void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
             g_dh_shm.dbg_dlopen = h ? 1 : 0;
             syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
-            if (h) { dh_install_health_hooks(); dh_swizzle_logstore(); dh_disable_floating_window(); }
+            // 落盘失败/悬浮窗抑制走引擎 dh_daemon_env()(已 setenv DH_DAEMON=1);此处只补 swizzle
+            // logstore(严格 daemon 无 UDS 出站,cap/log 靠内存桥 ring)——dh_img_added 若已装则幂等跳过。
+            if (h) dh_swizzle_logstore();
             return NULL;
         }
         usleep(200000);
@@ -565,6 +473,12 @@ static void dh_companion_init(void) {
 
     syslog(LOG_NOTICE, TAG " 进驻 %s pid=%d", g_proc, getpid());
 
+    // 告知引擎「运行在 daemon 环境」(先于任何 dlopen,故引擎 constructor 里首次 dh_daemon_env() 就读到)。
+    // 引擎据此源码级自调整:落盘失败不算健康故障、diag 不记落盘失败、不建悬浮窗——替代 companion 过去
+    // 对 dh_health_persist_fail/dh_diag_append 的 inline hook 与对 DHFloatingController 的 swizzle。
+    // 与 DH_DAEMON_UDS_SOCK(仅普通 daemon 设、管 cap/log 传输)解耦:两种 daemon 都设 DH_DAEMON=1。
+    setenv("DH_DAEMON", "1", 1);
+
     // 自适应选桥:探测能否 connect-out 到 collector。通=socket 桥;被 sandbox 拒=内存桥
     // (严格 daemon 如 securityd,靠 collector task_for_pid + vm_read/write 读写 g_dh_shm)。
     int probe = dh_connect(DH_CONN_CONTROL);
@@ -582,12 +496,12 @@ static void dh_companion_init(void) {
             syslog(LOG_NOTICE, TAG " %s 已启用,载引擎(UDS 直连)", g_proc);
             setenv("DH_DAEMON_UDS_SOCK", DH_BRIDGE_SOCK, 1);
             setenv("DH_DAEMON_UDS_PROC", g_proc, 1);
-            // 早注册镜像回调:引擎镜像载入即装 health/swizzle(拦早期落盘失败与最初几条 _persist);
-            // 普通 daemon 的 dh_img_added 不装 socket hook(见其内 g_mem_bridge 判断)。
-            _dyld_register_func_for_add_image(dh_img_added);
+            // 普通 daemon:落盘失败/悬浮窗抑制走引擎 dh_daemon_env()(DH_DAEMON=1 已设),cap/log 引擎源码级
+            // 自 emit(UDS 直连 collector),不本地 bind——companion 无需 hook 或 swizzle,也无需注册
+            // dh_img_added(它只为严格 daemon 内存桥装 socket hook + swizzle,对普通 daemon 是 no-op)。
             void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
             syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
-            if (h) { dh_install_health_hooks(); dh_swizzle_logstore(); dh_disable_floating_window(); }
+            (void)h;
         }
     } else {
         // 内存桥:严格 daemon 读不了 jb config,不能自判是否开启;设 magic 后起线程等 collector 的

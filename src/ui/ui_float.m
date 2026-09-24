@@ -476,6 +476,8 @@ static void dh_on_app_did_become_active(NSNotification *note) {
 
 // 安装通知监听 + 首次尝试
 void dh_ui_install_floating(void) {
+    // daemon 环境无 UI(也没有前台 App 可挂),不建悬浮窗——替代 companion 原来的 swizzle 屏蔽。
+    if (dh_daemon_env()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         // 注册通知 (幂等: 只在第一次安装)
         static BOOL notifications_installed = NO;
