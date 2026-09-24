@@ -30,6 +30,7 @@
 #import <sys/wait.h>      // waitpid
 #import <dlfcn.h>         // dlopen/dlsym(SBSUndimScreen 亮屏)
 #import <notify.h>        // notify_post(通知 SpringBoard 里的 DHUnlock 解锁)
+#import <mach/mach.h>     // mach_port_t / kern_return_t(IORegistry AppleSmartBattery 读电量)
 extern char **environ;
 
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
@@ -101,40 +102,44 @@ static float dh_screen_brightness(void) {
     });
     return bget ? bget() : -1.0f;
 }
-// 电量:IOKit IOPowerSources(惰性 dlopen,root daemon 直接调,不依赖 DHUnlock)。返回 0-100 百分比,
-// -1=拿不到。*charging 回填是否在充电。字段名(Current/Max Capacity、Is Charging)设备探针实测确认存在。
+// 电量:IORegistry AppleSmartBattery(惰性 dlopen IOKit,root 直接读;SpringBoard/BatteryCenter 底层
+// 也读它)。返回 0-100 百分比 = CurrentCapacity/MaxCapacity(MaxCapacity=100 时即 CurrentCapacity,
+// 精确到 1%、与系统 UI 一致),-1=拿不到。*charging 回填是否在充电(IsCharging bool)。
+// 不用 IOPSCopyPowerSourcesInfo:它的 Current Capacity 被 iOS 量化到 5%(90/85/80),粗。
+// 字段(CurrentCapacity/MaxCapacity/IsCharging)设备探针实测确认。
 static int dh_battery_level(int *charging) {
-    static CFTypeRef (*Info)(void); static CFArrayRef (*List)(CFTypeRef);
-    static CFDictionaryRef (*Desc)(CFTypeRef, CFTypeRef); static dispatch_once_t once;
+    static CFMutableDictionaryRef (*Matching)(const char *);
+    static mach_port_t (*GetService)(mach_port_t, CFDictionaryRef);
+    static kern_return_t (*CreateProps)(mach_port_t, CFMutableDictionaryRef *, CFAllocatorRef, uint32_t);
+    static kern_return_t (*Release)(mach_port_t);
+    static dispatch_once_t once;
     dispatch_once(&once, ^{
         void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
         if (h) {
-            Info = (CFTypeRef (*)(void))dlsym(h, "IOPSCopyPowerSourcesInfo");
-            List = (CFArrayRef (*)(CFTypeRef))dlsym(h, "IOPSCopyPowerSourcesList");
-            Desc = (CFDictionaryRef (*)(CFTypeRef, CFTypeRef))dlsym(h, "IOPSGetPowerSourceDescription");
+            Matching    = (CFMutableDictionaryRef (*)(const char *))dlsym(h, "IOServiceMatching");
+            GetService  = (mach_port_t (*)(mach_port_t, CFDictionaryRef))dlsym(h, "IOServiceGetMatchingService");
+            CreateProps = (kern_return_t (*)(mach_port_t, CFMutableDictionaryRef *, CFAllocatorRef, uint32_t))dlsym(h, "IORegistryEntryCreateCFProperties");
+            Release     = (kern_return_t (*)(mach_port_t))dlsym(h, "IOObjectRelease");
         }
     });
     if (charging) *charging = 0;
-    if (!Info || !List || !Desc) return -1;
-    CFTypeRef blob = Info();
-    if (!blob) return -1;
+    if (!Matching || !GetService || !CreateProps || !Release) return -1;
+    mach_port_t svc = GetService(0, Matching("AppleSmartBattery"));  // GetService 消费 matching 引用,不用 release
+    if (!svc) return -1;
     int pct = -1;
-    CFArrayRef list = List(blob);
-    if (list && CFArrayGetCount(list) > 0) {
-        CFDictionaryRef d = Desc(blob, CFArrayGetValueAtIndex(list, 0));  // Get:不 release
-        if (d) {
-            int cur = -1, max = -1;
-            CFNumberRef cn = CFDictionaryGetValue(d, CFSTR("Current Capacity"));
-            CFNumberRef mn = CFDictionaryGetValue(d, CFSTR("Max Capacity"));
-            if (cn) CFNumberGetValue(cn, kCFNumberIntType, &cur);
-            if (mn) CFNumberGetValue(mn, kCFNumberIntType, &max);
-            if (max > 0 && cur >= 0) pct = cur * 100 / max;
-            CFBooleanRef ch = CFDictionaryGetValue(d, CFSTR("Is Charging"));
-            if (charging && ch) *charging = CFBooleanGetValue(ch) ? 1 : 0;
-        }
+    CFMutableDictionaryRef props = NULL;
+    if (CreateProps(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+        int cur = -1, max = -1;
+        CFNumberRef cn = CFDictionaryGetValue(props, CFSTR("CurrentCapacity"));
+        CFNumberRef mn = CFDictionaryGetValue(props, CFSTR("MaxCapacity"));
+        if (cn) CFNumberGetValue(cn, kCFNumberIntType, &cur);
+        if (mn) CFNumberGetValue(mn, kCFNumberIntType, &max);
+        if (max > 0 && cur >= 0) pct = cur * 100 / max;   // MaxCapacity=100 时即精确 1% 百分比
+        CFBooleanRef ch = CFDictionaryGetValue(props, CFSTR("IsCharging"));
+        if (charging && ch && CFGetTypeID(ch) == CFBooleanGetTypeID()) *charging = CFBooleanGetValue(ch) ? 1 : 0;
+        CFRelease(props);
     }
-    if (list) CFRelease(list);   // Copy:要 release
-    CFRelease(blob);             // Copy:要 release
+    Release(svc);
     return pct;
 }
 // 锁屏状态:读 DHUnlock 写的 /var/jb/tmp/dh_lockstate("1"锁/"0"解);无文件(没装 DHUnlock)返回 -1=未知。
