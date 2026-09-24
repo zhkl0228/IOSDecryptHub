@@ -20,11 +20,13 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <time.h>
+#include <sys/stat.h>   // mkdir(记录注入 pid 目录)
 
 #define FRIDA_TAG   "[dh-frida]"
 #define REQ_FILE    "/var/jb/tmp/dh-frida-req"        // collector 写:一行 bundle id
 #define JS_DIR      "/var/jb/usr/lib/IOSDecryptHub/frida"  // <bundle>.js
 #define MSG_LOG     "/var/log/dh-frida.jsonl"              // script console.log/send 落这,collector 读给 web 显示
+#define INJ_DIR     "/var/jb/tmp/dh-frida-inj"             // 注入成功后写 <bundle>=pid,供 collector 判"当前实例是否已注入"
 #define RESUME_DELAY_US 800000                         // spawn→resume 后等 App 起来再 attach
 
 static GMainLoop *loop;
@@ -113,6 +115,15 @@ static void spawn_inject(const gchar *bundle) {
     frida_script_load_sync(scr, NULL, &e);
     if (e) { frida_error(bundle, "load", e->message); goto done; }   // 加载错误
     syslog(LOG_NOTICE, FRIDA_TAG " %s pid=%u 注入成功(script 保持)", bundle, pid);
+    // 记下"该 bundle 已注入到 pid":collector 的保持前台监控据此判断——若目标 App 当前运行的 pid 与此不符
+    // (比如用户点图标冷启的新实例),说明是未注入实例,frida 就绪时会 kill+重新 spawn 注入。
+    {
+        mkdir(INJ_DIR, 0755);
+        gchar *inj_path = g_strdup_printf("%s/%s", INJ_DIR, bundle);
+        FILE *ip = fopen(inj_path, "w");
+        if (ip) { fprintf(ip, "%u", pid); fclose(ip); }
+        g_free(inj_path);
+    }
     // 故意不 unref sess/scr:保持注入直到目标退出(detach 会 unload)。daemon 注入次数少,可接受。
 done:
     g_clear_error(&e);

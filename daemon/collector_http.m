@@ -51,6 +51,7 @@ extern int  dh_task_suspend_count(int pid);                     // collector.c:t
 #define DH_LOCK_NOTIFY    "com.iosdecrypthub.lock"     // 手动锁屏 darwin 通知(DHUnlock 监听)
 #define DH_FRIDA_DIR   @"/var/jb/usr/lib/IOSDecryptHub/frida"   // Frida JS 脚本目录(<bundle>.js)
 #define DH_FRIDA_REQ   @"/var/jb/tmp/dh-frida-req"              // 写 bundle id → dh_frida daemon spawn+注入
+#define DH_FRIDA_INJ_DIR @"/var/jb/tmp/dh-frida-inj"            // dh_frida 注入成功写 <bundle>=pid;读它判"当前实例是否已注入"
 static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
 static NSString *fridaJsPath(NSString *bundle);   // fwd(Frida JS 路径,定义在 handleControl 前)
 // 门控 config 读:key 下的数组是否含 val。key = DH_KEY_EXECS(daemon)/ DH_KEY_BUNDLES(App)。
@@ -1154,15 +1155,22 @@ static NSString *fgExecForBundle(NSString *bundle) {
     for (NSDictionary *a in enumApps()) if ([a[@"bundle"] isEqualToString:bundle]) return a[@"exec"];
     return @"";
 }
+// dh_frida 注入成功记录的 pid(该 bundle 上次被注入到哪个进程);无记录/读不到返回 -1。
+static int fridaInjectedPid(NSString *bundle) {
+    NSString *p = [DH_FRIDA_INJ_DIR stringByAppendingPathComponent:bundle];
+    NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    return s.length ? [s intValue] : -1;
+}
 static void *fgKeepThread(void *arg) {
     (void)arg;
     NSString *lastBundle = @"";
     NSTimeInterval bgSince = 0;            // 首次发现目标被挂起的时刻;0=当前在前台/无目标
+    int lastRestartPid = -1;               // 上次为"未注入"而 kill 重启的 pid,防对同一实例反复 kill
     const NSTimeInterval kBgLimit = 60;    // 被挂起(后台)超过这么久就拉回前台
     for (;;) {
         @autoreleasepool {
             NSString *bundle = cfgGetScalar(DH_KEY_FGKEEP);
-            if (![bundle isEqualToString:lastBundle]) { lastBundle = bundle; bgSince = 0; }   // 目标切换,重置计时
+            if (![bundle isEqualToString:lastBundle]) { lastBundle = bundle; bgSince = 0; lastRestartPid = -1; }   // 目标切换,重置
             if (bundle.length) {
                 NSString *exec = fgExecForBundle(bundle);
                 int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
@@ -1175,16 +1183,31 @@ static void *fgKeepThread(void *arg) {
                         aggLog([NSString stringWithFormat:@"[fg-keep] %@ 已退出,frida 未就绪,等待重试", bundle]);
                     bgSince = 0;
                 } else {
-                    int sc = dh_task_suspend_count(pid);
-                    if (sc == 0) { bgSince = 0; }              // 前台/活跃
-                    else if (sc > 0) {                          // 被系统挂起=在后台
-                        if (bgSince == 0) bgSince = now;
-                        else if (now - bgSince >= kBgLimit) {
-                            aggLog([NSString stringWithFormat:@"[fg-keep] %@ 后台 %.0fs,拉回前台", bundle, now - bgSince]);
-                            dh_undim_screen(); launchApp(bundle); bgSince = 0;
+                    // ① 未注入实例检测:配了 JS + frida 就绪 + 当前 pid ≠ 已注入 pid → 判为图标点开的未注入实例,
+                    //    kill 后写 req 让 dh_frida spawn 冷启并注入(与 web「重启」同路)。frida 未就绪则不动——
+                    //    避免白闪一下也注入不了(用户明确要求)。lastRestartPid 防对同一未注入 pid 反复 kill。
+                    BOOL restarted = NO;
+                    if ([[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)] && dh_frida_ready()) {
+                        int injPid = fridaInjectedPid(bundle);
+                        if (pid != injPid && pid != lastRestartPid) {
+                            aggLog([NSString stringWithFormat:@"[fg-keep] %@ 运行中但未注入 frida(pid %d,注入记录 %d),kill 后 spawn 重注入", bundle, pid, injPid]);
+                            killAppByBundle(bundle);
+                            [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                            lastRestartPid = pid; bgSince = 0; restarted = YES;
                         }
                     }
-                    // sc<0:task_for_pid 失败(进程正退/受保护),不动,下轮 dh_proc_alive 反映
+                    if (!restarted) {
+                        int sc = dh_task_suspend_count(pid);
+                        if (sc == 0) { bgSince = 0; }              // 前台/活跃
+                        else if (sc > 0) {                          // 被系统挂起=在后台
+                            if (bgSince == 0) bgSince = now;
+                            else if (now - bgSince >= kBgLimit) {
+                                aggLog([NSString stringWithFormat:@"[fg-keep] %@ 后台 %.0fs,拉回前台", bundle, now - bgSince]);
+                                dh_undim_screen(); launchApp(bundle); bgSince = 0;
+                            }
+                        }
+                        // sc<0:task_for_pid 失败(进程正退/受保护),不动,下轮 dh_proc_alive 反映
+                    }
                 }
             }
         }
