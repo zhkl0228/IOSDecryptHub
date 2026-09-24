@@ -1,13 +1,13 @@
 #!/bin/bash
 # build_deb.sh — 打包 IOSDecryptHub rootless / roothide 越狱 deb
 #
-# dylib:
-#   vendor/dylib/rootless/decrypt_helper.dylib   (arm64)
-#   vendor/dylib/roothide/decrypt_helper.dylib   (arm64 + arm64e)
+# dylib（引擎，由本仓 src/ 编译后落在 vendor/ 下，不入版本库）:
+#   vendor/dylib/rootless/decrypt_helper.dylib   VARIANT=rootless, arm64
+#   vendor/dylib/roothide/decrypt_helper.dylib   VARIANT=roothide, arm64 + arm64e
 #
 # 包内组件:
 #   IOSDecryptHubLoader.dylib  ElleKit 注入加载器（读名单 → dlopen 引擎，无 hook）
-#   decrypt_helper.dylib       闭源引擎（vendor 成品）
+#   decrypt_helper.dylib       运行时分析引擎（本仓 src/ 编译产物）
 #   IOSDecryptHubManager.app   管理器 App（唯一入口：应用开关 / 更新 / 关于）
 #   IOSDecryptHubUpdated       updater daemon，一次性进程（检查/安装/回滚），见 AGENTS.md
 #
@@ -247,8 +247,9 @@ require_vendor_dylib() {
     local VARIANT="$1"
     local EXPECTED_ARCH="$2"
     local DYLIB="$VENDOR_DIR/$VARIANT/decrypt_helper.dylib"
-    [ -f "$DYLIB" ] || error "缺少成品 dylib: $DYLIB
-请先由私有仓执行 make deb，或手动把对应架构的 decrypt_helper.dylib 放到该路径。"
+    [ -f "$DYLIB" ] || error "缺少引擎: $DYLIB
+请先在仓库根目录执行 make deb（会自动编译引擎并落到 vendor/dylib/），
+或手动把对应架构的 decrypt_helper.dylib 放到该路径。"
     verify_macho_arch "$DYLIB" "$EXPECTED_ARCH" "$VARIANT 主 dylib (vendor)"
     echo "$DYLIB"
 }
@@ -261,9 +262,10 @@ build_variant() {
     # 管理器 App 与 updater daemon 是独立进程，arm64 单切片即可运行；
     # loader 与引擎则需 arm64e 切片才能注入 arm64e 系统 App。
     local APP_MACHO_ARCHS="${5:-$MACHO_ARCHS}"
-    # 引擎取自哪个 vendor 目录（默认与变体同名）。rootless 也复用 roothide 的胖引擎
-    # （其 arm64e 切片已由 tools/patch_engine_arm64e_pac.py 打过 PAC 补丁），
-    # 这样 Dopamine 等 rootless 越狱也能对系统 App 生效。
+    # 引擎取自哪个 vendor 目录（默认与变体同名）。本 fork：rootless 与 roothide 各用自己变体的
+    # arm64+arm64e 胖引擎（都要 arm64e 切片才能对 arm64e 系统 App/daemon 生效；arm64e PAC 已由
+    # src/core/fishhook.c 源码原生处理）。变体号只影响引擎 MCP 自报的 variant 字段（rootless=2/
+    # roothide=3），各用各的以保证「包名 variant 与引擎自报一致」。
     local ENGINE_VARIANT="${6:-$VARIANT}"
 
     local STAGE="$BUILD_DIR/stage-$VARIANT"
@@ -742,13 +744,13 @@ mkdir -p "$BUILD_DIR"
 case "$TARGET" in
     all)
         build_variant "rootless" "/var/jb" \
-            "iphoneos-arm64" "arm64 arm64e" "arm64" "roothide"
+            "iphoneos-arm64" "arm64 arm64e" "arm64"
         build_variant "roothide" "" \
             "iphoneos-arm64e" "arm64 arm64e" "arm64 arm64e"
         ;;
     rootless)
         build_variant "rootless" "/var/jb" \
-            "iphoneos-arm64" "arm64 arm64e" "arm64" "roothide"
+            "iphoneos-arm64" "arm64 arm64e" "arm64"
         ;;
     roothide)
         build_variant "roothide" "" \

@@ -565,11 +565,15 @@ static pid_t mb_pid_of(const char *proc, struct kinfo_proc *procs, int cnt) {
     return 0;
 }
 
-// 销毁一条内存桥:关 LAN 监听(mb_lan_thread 的 accept 返回而退出)、释放 task(在跑的 mb_conn_thread
-// 靠 task 存活探测发现 vm 失败后退出)。t 本身不 free —— detach 线程无法 join,故意保留(每 daemon
-// 重启才泄漏一个 ~80B 结构,可忽略),避免 use-after-free。
+// 销毁一条内存桥:先 shutdown 再 close LAN 监听,释放 task(在跑的 mb_conn_thread 靠 task 存活探测
+// 发现 vm 失败后退出)。t 本身不 free —— detach 线程无法 join,故意保留(每 daemon 重启才泄漏一个
+// ~80B 结构,可忽略),避免 use-after-free。
+// **必须 shutdown**:mb_lan_thread 阻塞在 accept(lan_fd),Darwin 上光 close(lan_fd) 不会唤醒别的
+// 线程的 accept —— 线程滞留、监听 socket 不释放,重启严格 daemon 后重建 bind 同端口报 EADDRINUSE
+// (实测严格 daemon 无引擎连接时拖十几分钟才自愈)。shutdown(SHUT_RDWR) 让 accept 返回错误、
+// mb_lan_thread 的 accept<0 分支 break 退出,端口即刻释放,下一轮即可重建。
 static void mb_teardown(mb_target_t *t) {
-    if (t->lan_fd >= 0) { close(t->lan_fd); t->lan_fd = -1; }
+    if (t->lan_fd >= 0) { shutdown(t->lan_fd, SHUT_RDWR); close(t->lan_fd); t->lan_fd = -1; }
     if (t->task != MACH_PORT_NULL) { mach_port_deallocate(mach_task_self(), t->task); t->task = MACH_PORT_NULL; }
 }
 static void *mem_bridge_manager(void *arg) {

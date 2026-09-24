@@ -3,14 +3,40 @@ build/
 *.deb
 *.dSYM/
 *.o
+*.a
+*.profraw
 
-# 引擎打补丁前的原件备份（可随时从上游重新下载，见 tools/patch_engine_arm64e_pac.py）
+# 引擎打补丁前的原件备份 / IDA 分析基线（本地留存，不入库）
 *.pristine
 
 # frida-core devkit（~176MB libfrida-core.a，从 frida releases 下载,版本匹配 frida-server，见 src/dh_frida.c）
 #   下载:https://github.com/frida/frida/releases/download/<ver>/frida-core-devkit-<ver>-ios-arm64.tar.xz
 vendor/frida-core-devkit/
 
+# 编译出的引擎 (根目录产物)
+/decrypt_helper.dylib
+/decrypt_helper-*.dylib
+/decrypt_helper.mac.dylib
+/decrypt_helper.sim.dylib
+
+# 打包用的引擎落地目录 —— 由 make deb / make test-updater 编译生成, 不入版本库
+vendor/dylib/*/*.dylib
+
+# 生成的 Web 资源头文件 (make 自动从 web/ 生成)
+src/server/web_index_html.h
+src/server/web_wechat_png.h
+
+# inject.sh 中间产物
+work_*/
+hooked_*.ipa
+*-hooked*.ipa
+
+# 系统 / 编辑器垃圾
 .DS_Store
 *.swp
+
+# Python 缓存
+__pycache__/
+
+# AI 工具配置
 .claude/
