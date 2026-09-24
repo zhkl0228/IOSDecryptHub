@@ -1,4 +1,4 @@
-// dh_unlock.m — DHUnlock.dylib:注入 SpringBoard 的自动解锁组件(照 zhkl0228 的 rp tweak 实现)
+// dh_unlock.m — DHUnlock.dylib:注入 SpringBoard 的自动解锁 + 锁屏组件(照 zhkl0228 的 rp tweak 实现)
 //
 // 背景:无密码设备的锁屏 UI dismiss 必须在 SpringBoard 进程内调 SBLockScreenManager 的
 //   unlockUIFromSource:(实测外部 daemon 的 SBSUndimScreen/uiopen/MKBUnlockDevice 都只能亮屏、进不了桌面)。
@@ -9,7 +9,14 @@
 //      (曾经在通知回调线程直接裸调 unlockUIFromSource,日志显示"已执行"但 locked 仍为 1,就是没在主线程)。
 //   2. 主线程:[SBLockScreenManager sharedInstance] isUILocked → unlockUIFromSource:0 withOptions:nil。
 //   3. 再 dispatch_after 2 秒主队列:[UIApplication sharedApplication] setIdleTimerDisabled:YES
-//      + [springBoard _returnToHomeScreenWithCompletion:] 回桌面(只解锁不回桌面会停在锁屏下的界面)。
+//      + 模拟按 HOME 键去桌面(只解锁不去桌面会停在锁屏下的界面)。app 即 SpringBoard(UIApplication 子类),
+//      调 _simulateHomeButtonPressWithCompletion:(系统合成 HOME 事件,不依赖物理键,Face ID 设备/新系统同样有效;
+//      设备 DSC 实证存在),级联兜底 rp 原版的 _returnToHomeScreenWithCompletion:。见 dh_do_unlock_main。
+//
+// 锁屏(本 fork 扩展,与解锁对称):collector 发 com.iosdecrypthub.lock → 主队列调
+//   [SBLockScreenManager sharedInstance] lockUIFromSource:withOptions:(unlockUIFromSource:withOptions: 的对称方法,
+//   设备 DSC 实证存在),级联兜底 [SpringBoard _simulateLockButtonPress](模拟锁定键,兼锁屏+息屏)。见 dh_do_lock_main。
+//   web 面板据锁屏态把按钮在「解锁/亮屏」与「锁屏」之间切换。
 //
 // 崩溃教训:绝不在 constructor(dyld initializer)里同步碰 SBLockScreenManager——那时 SpringBoard 未初始化完,
 //   +[SBLockScreenManager _sharedInstanceCreateIfNeeded:] 内部 NSAssert 失败→SIGABRT→崩进 Safe Mode。
@@ -19,6 +26,7 @@
 // 通知:
 //   com.apple.springboard.lockstate  系统锁屏状态变化 → 若设了 foregroundKeep 则(延迟)自动解锁
 //   com.iosdecrypthub.unlock         collector 手动解锁通知(点 web「解锁」即发,无条件解一次)
+//   com.iosdecrypthub.lock           collector 手动锁屏通知(点 web「锁屏」即发,无条件锁一次)
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -81,7 +89,7 @@ static void dh_write_frontmost(void) {
     [bid writeToFile:DH_FRONTMOST_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-// 【主队列】真正解锁 + 回桌面(照 rp tryUnlockDevice)。
+// 【主队列】真正解锁 + 按 HOME 键去桌面(解锁步骤照 rp tryUnlockDevice;去桌面本 fork 改为模拟 HOME 键)。
 static void dh_do_unlock_main(const char *reason) {
     Class cls = objc_getClass("SBLockScreenManager");
     if (!cls) return;
@@ -90,20 +98,77 @@ static void dh_do_unlock_main(const char *reason) {
     if (!((BOOL (*)(id, SEL))objc_msgSend)(mgr, sel_getUid("isUILocked"))) return;   // 已解锁不动
     ((void (*)(id, SEL, long, id))objc_msgSend)(mgr, sel_getUid("unlockUIFromSource:withOptions:"), 0, nil);
     syslog(LOG_NOTICE, UNLOCK_TAG " unlockUIFromSource:0(主线程,%s)", reason);
-    // 2 秒后回桌面 + 关自动锁屏(照 rp)
+    // 2 秒后模拟按 HOME 键 + 关自动锁屏。
+    // 「按 HOME 键」用 SpringBoard(app 即 UIApplication 子类)的 _simulateHomeButtonPressWithCompletion::
+    // 由系统合成 HOME 事件,不依赖物理 HOME 键——无物理键(Face ID)设备与新系统一样有效(设备 DSC 实证存在)。
+    // 前台 App 走标准 进入后台/挂起 生命周期、转场系统原生。级联兜底 _returnToHomeScreenWithCompletion:
+    // (rp 原版的程序化回主屏,同样通用):未来系统若无前者,退到它仍能回主屏。两条都打 NOTICE 记走哪条;
+    // 两者都探不到才 LOG_ERR(fail-loud,不静默)——拿到那条日志即知该系统要换新的回主屏 API。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class ua = objc_getClass("UIApplication");
         if (!ua) return;
         id app = dh_msg0((id)ua, "sharedApplication");
         if (!app) return;
         ((void (*)(id, SEL, BOOL))objc_msgSend)(app, sel_getUid("setIdleTimerDisabled:"), YES);
-        if ([app respondsToSelector:sel_getUid("_returnToHomeScreenWithCompletion:")]) {
+        SEL simHome = sel_getUid("_simulateHomeButtonPressWithCompletion:");
+        SEL retHome = sel_getUid("_returnToHomeScreenWithCompletion:");
+        if ([app respondsToSelector:simHome]) {
             id done = [^{} copy];
-            ((void (*)(id, SEL, id))objc_msgSend)(app, sel_getUid("_returnToHomeScreenWithCompletion:"), done);
+            ((void (*)(id, SEL, id))objc_msgSend)(app, simHome, done);
+            syslog(LOG_NOTICE, UNLOCK_TAG " 模拟按 HOME 键(_simulateHomeButtonPressWithCompletion:)+ setIdleTimerDisabled:YES");
+        } else if ([app respondsToSelector:retHome]) {
+            id done = [^{} copy];
+            ((void (*)(id, SEL, id))objc_msgSend)(app, retHome, done);
+            syslog(LOG_NOTICE, UNLOCK_TAG " 回主屏(_returnToHomeScreenWithCompletion:;无 HOME 模拟)+ setIdleTimerDisabled:YES");
+        } else {
+            syslog(LOG_ERR, UNLOCK_TAG " SpringBoard 无 _simulateHomeButtonPressWithCompletion:/_returnToHomeScreenWithCompletion:"
+                            "(respondsToSelector 均 0)——该系统需换回主屏 API,HOME 本次未触发");
         }
-        syslog(LOG_NOTICE, UNLOCK_TAG " 回桌面 + setIdleTimerDisabled:YES");
     });
     dh_write_lockstate_async();   // 解锁后刷新状态文件
+}
+
+// 是否已锁(SBLockScreenManager isUILocked;拿不到 mgr 返回 -1)。
+static int dh_is_ui_locked(void) {
+    Class cls = objc_getClass("SBLockScreenManager");
+    id mgr = cls ? dh_msg0((id)cls, "sharedInstance") : nil;
+    if (!mgr) return -1;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(mgr, sel_getUid("isUILocked")) ? 1 : 0;
+}
+
+// 【主队列】真正锁屏。实测(设备日志)SBLockScreenManager lockUIFromSource:withOptions: 虽 respondsToSelector=YES
+// 且被调用,但在 iOS 18.5 上**不触发真正锁屏**(isUILocked 仍 0),它只管锁屏 UI 内部来源标记,不锁设备。
+// 故主用 [SpringBoard _simulateLockButtonPress](模拟侧边/电源键单击 → 真锁屏+息屏,任何设备都有此键;DSC 实证),
+// lockUIFromSource:withOptions: 退为兜底。都 respondsToSelector 守卫;两者都无才 LOG_ERR(fail-loud)。
+// 调用后 1.5s 校验 isUILocked 是否真锁上——调了却没锁也 LOG_ERR(拿样本:该方法在本系统无效,需再换 API)。
+static void dh_do_lock_main(const char *reason) {
+    if (dh_is_ui_locked() == 1) return;   // 已锁不动
+    Class ua = objc_getClass("UIApplication");
+    id app = ua ? dh_msg0((id)ua, "sharedApplication") : nil;
+    Class cls = objc_getClass("SBLockScreenManager");
+    id mgr = cls ? dh_msg0((id)cls, "sharedInstance") : nil;
+    SEL simLock = sel_getUid("_simulateLockButtonPress");
+    SEL lockSel = sel_getUid("lockUIFromSource:withOptions:");
+    const char *used;
+    if (app && [app respondsToSelector:simLock]) {
+        ((void (*)(id, SEL))objc_msgSend)(app, simLock);
+        used = "_simulateLockButtonPress";
+    } else if (mgr && [mgr respondsToSelector:lockSel]) {
+        ((void (*)(id, SEL, long, id))objc_msgSend)(mgr, lockSel, 0, nil);   // source 沿用解锁的 0
+        used = "lockUIFromSource:0";
+    } else {
+        syslog(LOG_ERR, UNLOCK_TAG " 无 _simulateLockButtonPress/lockUIFromSource:withOptions:"
+                        "(respondsToSelector 均 0)——该系统需换锁屏 API,锁屏本次未触发");
+        return;
+    }
+    syslog(LOG_NOTICE, UNLOCK_TAG " 锁屏调用 %s(主线程,%s)", used, reason);
+    // 1.5s 后校验是否真锁上 + 刷新状态文件。fail-loud:调了却没锁,把实况打出来好换 API。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        int locked = dh_is_ui_locked();
+        dh_write_lockstate_async();
+        if (locked == 1) syslog(LOG_NOTICE, UNLOCK_TAG " 锁屏成功(%s 后 isUILocked=1)", used);
+        else syslog(LOG_ERR, UNLOCK_TAG " 锁屏无效:%s 调用后 isUILocked=%d(≠1)——该方法在本系统不锁设备,需换锁屏 API", used, locked);
+    });
 }
 
 // 通知回调 → 延迟 3 秒到【主队列】(照 rp:等锁屏稳定 + UI 必须主线程)。
@@ -127,6 +192,12 @@ static void manual_cb(CFNotificationCenterRef center, void *observer,
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
     dh_schedule_unlock("manual");
 }
+// collector 手动锁屏通知:点了 web「锁屏」即锁,无条件锁一次。锁屏不需等状态稳定,直接上主队列(UI 必须主线程)。
+static void manual_lock_cb(CFNotificationCenterRef center, void *observer,
+                           CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{ dh_do_lock_main("manual"); });
+}
 
 __attribute__((constructor))
 static void dh_unlock_init(void) {
@@ -138,6 +209,8 @@ static void dh_unlock_init(void) {
         CFSTR("com.apple.springboard.lockstate"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(dc, NULL, manual_cb,
         CFSTR("com.iosdecrypthub.unlock"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(dc, NULL, manual_lock_cb,
+        CFSTR("com.iosdecrypthub.lock"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     // 初始锁屏状态延迟到主 runloop(SpringBoard 就绪)再写;绝不在此同步碰 SBLockScreenManager。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dh_write_lockstate_async();
@@ -149,5 +222,5 @@ static void dh_unlock_init(void) {
                               (uint64_t)(1 * NSEC_PER_SEC), (uint64_t)(200 * NSEC_PER_MSEC));
     dispatch_source_set_event_handler(g_fg_timer, ^{ dh_write_frontmost(); });
     dispatch_resume(g_fg_timer);
-    syslog(LOG_NOTICE, UNLOCK_TAG " 已装(照 rp:延迟+主线程解锁+回桌面;设了 foregroundKeep 即自动解锁;前台查询已启)");
+    syslog(LOG_NOTICE, UNLOCK_TAG " 已装(照 rp:延迟+主线程解锁+按 HOME 键去桌面;可手动锁屏;设了 foregroundKeep 即自动解锁;前台查询已启)");
 }

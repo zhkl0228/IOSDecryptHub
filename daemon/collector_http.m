@@ -48,6 +48,7 @@ extern int  dh_task_suspend_count(int pid);                     // collector.c:t
 #define DH_KEY_FGKEEP  @"foregroundKeep"        // 「保持前台」目标 bundle id(单值;空/缺=关闭);独立于注入名单
 // SpringBoard 里的 DHUnlock 读 foregroundKeep:非空即在锁屏时自动解锁(两者绑定,无单独开关)。
 #define DH_UNLOCK_NOTIFY  "com.iosdecrypthub.unlock"   // 手动解锁 darwin 通知(DHUnlock 监听)
+#define DH_LOCK_NOTIFY    "com.iosdecrypthub.lock"     // 手动锁屏 darwin 通知(DHUnlock 监听)
 #define DH_FRIDA_DIR   @"/var/jb/usr/lib/IOSDecryptHub/frida"   // Frida JS 脚本目录(<bundle>.js)
 #define DH_FRIDA_REQ   @"/var/jb/tmp/dh-frida-req"              // 写 bundle id → dh_frida daemon spawn+注入
 static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
@@ -914,6 +915,12 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         dh_undim_screen();
         notify_post(DH_UNLOCK_NOTIFY);
         sendJSON(fd, @{@"ok": @YES, @"undim": @YES, @"notified": @YES}); return;
+    }
+    // 锁屏:发 darwin 通知让 SpringBoard 里的 DHUnlock 调 lockUIFromSource:withOptions:(unlockUIFromSource 的对称)。
+    // 与解锁同理,真正锁屏必须在 SpringBoard 进程内;DHUnlock 没装则无效(web 按钮据锁屏态才会显示「锁屏」)。
+    if ([action isEqualToString:@"lock"]) {
+        notify_post(DH_LOCK_NOTIFY);
+        sendJSON(fd, @{@"ok": @YES, @"notified": @YES}); return;
     }
     send404(fd);
 }

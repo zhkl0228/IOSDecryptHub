@@ -114,7 +114,7 @@ async function loadA(){
   _fridaAvail = !!a.fridaAvail;
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
-        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" onclick="unlockDev()">解锁/亮屏</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
+        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" id="pwrbtn" data-mode="unlock" onclick="pwrToggle()">解锁/亮屏</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
       + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" onclick="keepFg(\'\')">关闭保持前台</button></div>'
       + '<div id="atbl"></div>'
       + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
@@ -123,11 +123,17 @@ async function loadA(){
       + '设了目标后,设备锁屏会自动解锁(需装 DHUnlock 组件;两者绑定,无单独开关)。</div>';
   }
   var fn=document.getElementById("fgnow"); if(fn) fn.textContent = (a.foreground&&a.foreground.length) ? a.foreground : "(无/未知)";
+  var lk=a.locked, on=a.screenOn;   // lk: 1锁 0解 -1未知
   var sc=document.getElementById("scr");
   if(sc){
-    var lk=a.locked, on=a.screenOn;   // lk: 1锁 0解 -1未知
     var t = lk===1?"🔒 锁屏" : (lk===0?"🟢 已解锁" : (on?"亮屏":"息屏"));
     sc.textContent = t + " · " + (on?"亮":"息") + (lk===-1?"(装 DHUnlock 显示锁屏态)":"");
+  }
+  // 已知已解锁(lk===0)才切「锁屏」;锁屏中/未知(未装 DHUnlock)一律「解锁/亮屏」。
+  var pb=document.getElementById("pwrbtn");
+  if(pb){
+    if(lk===0){ pb.textContent="🔒 锁屏"; pb.dataset.mode="lock"; }
+    else { pb.textContent="解锁/亮屏"; pb.dataset.mode="unlock"; }
   }
   var bt=document.getElementById("batt");
   if(bt){
@@ -182,9 +188,17 @@ async function keepFg(b){
   if(r.ok){ toast(b?("已设为保持前台:"+b):"已关闭保持前台"); loadA(); }
   else toast("失败:"+(r.err||""), true);
 }
-async function unlockDev(){
-  var r = await post("/api/control/unlock");
-  toast(r.ok ? "已亮屏 + 发解锁通知(需装 DHUnlock 才真解锁)" : "失败", !r.ok);
+async function pwrToggle(){
+  var pb=document.getElementById("pwrbtn");
+  var mode = pb ? pb.dataset.mode : "unlock";
+  if(mode==="lock"){
+    var r = await post("/api/control/lock");
+    toast(r.ok ? "已发锁屏通知(需装 DHUnlock 才真锁屏)" : "失败", !r.ok);
+  }else{
+    var r = await post("/api/control/unlock");
+    toast(r.ok ? "已亮屏 + 发解锁通知(需装 DHUnlock 才真解锁)" : "失败", !r.ok);
+  }
+  setTimeout(loadA, 1500);   // 刷新锁屏态,按钮随之在「解锁/亮屏」与「锁屏」间切换
 }
 
 function fridaClose(){ var o=document.getElementById("fovl"); if(o)o.style.display="none"; if(window._flogTimer){clearInterval(window._flogTimer);window._flogTimer=null;} }
