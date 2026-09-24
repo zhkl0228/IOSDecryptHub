@@ -172,8 +172,11 @@ compile_collector() {
     mkdir -p "$(dirname "$OUT")"
     # collector.c(桥接主体,C)+ collector_http.m(聚合历史查询 HTTP,ObjC,链 Foundation:
     # 读 cap.jsonl 用 NSJSONSerialization 重建 /api、托管 WebUI、索引页)
+    # -DENGINE_VER 从 Makefile VERSION 注入:collector 重建 stats 的引擎版本与引擎 DH_VERSION_STR 同源,
+    # 升级只改 Makefile 一处,不再和 collector_http.m 硬编码双真相源漂移。
     $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
         -Wall -O2 -fobjc-arc -framework Foundation \
+        -DENGINE_VER="\"$VERSION\"" \
         "$COLLECTOR_SRC" "$SCRIPT_DIR/daemon/collector_http.m" -o "$OUT"
 }
 
@@ -335,7 +338,10 @@ CTRL
     cp "$DHUNLOCK_PLIST_SRC" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/DHUnlock.plist"
     cp "$COLLECTOR_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
     # 引擎 WebUI 快照 + 聚合控制台 SPA:collector 托管(用 _NSGetExecutablePath 定位同目录)。
-    cp "$SCRIPT_DIR/daemon/webui.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/webui.html"
+    # 托管页直接用引擎 WebUI 源 web/index.html(单一真相源,与引擎内嵌的 web_index_html.h 同源),
+    # 不再维护 daemon/webui.html 手工副本——那会随 web/index.html 更新而静默漂移(collector 机械路径
+    # 改写仍"看似成功"地作用在旧串上)。
+    cp "$SCRIPT_DIR/web/index.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/webui.html"
     cp "$SCRIPT_DIR/daemon/panel.html" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/panel.html"
     # Frida 编排 daemon + JS 目录(可选组件:有 devkit 才装二进制;JS 目录总是建,供 collector 写 <bundle>.js)
     mkdir -p "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/frida"

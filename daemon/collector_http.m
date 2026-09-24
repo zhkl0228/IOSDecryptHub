@@ -177,7 +177,9 @@ static NSString *procState(NSString *proc, int *lanPort) {
 }
 
 #define AGG_PORT 8089
-#define ENGINE_VER "1.27.5"   // 重建 stats 显示用(当前 vendor 引擎版本;仅展示)
+#ifndef ENGINE_VER
+#define ENGINE_VER "1.27.5"   // 兜底;正常由 build_deb.sh 的 -DENGINE_VER 从 Makefile VERSION 注入(单一真相源,不再手动同步)
+#endif
 
 static void aggLog(NSString *s) { dh_log([s UTF8String]); }
 
@@ -223,16 +225,29 @@ static NSString *hexdumpOf(NSData *d) {
     }
     return s;
 }
-// 列表用短预览:输入可打印则截前 96 字节文本,否则前 24 字节 hex。
+// 列表短预览,对齐引擎 dh_log_entry_summary(dh_log_json.m:100-118):输入取前 256 字节整体解码、
+// ≤200 字符、有更多加 "…";非 UTF-8 回退前 32 字节 hex。(逐字节退 3 找有效 UTF-8,避免多字节切断致乱码)
 static NSString *inPreview(NSData *d) {
     if (!d.length) return @"";
-    NSString *u = utf8Of(d);
-    if (u) return u.length > 96 ? [u substringToIndex:96] : u;
-    return hexOf([d subdataWithRange:NSMakeRange(0, MIN(d.length, (NSUInteger)24))]);
+    NSUInteger cap = MIN(d.length, (NSUInteger)256);
+    NSString *u = nil;
+    for (NSUInteger n = cap; n >= (cap > 3 ? cap - 3 : 1); n--) {
+        u = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, n)] encoding:NSUTF8StringEncoding];
+        if (u) break;
+    }
+    if (u.length) {
+        BOOL more = d.length > cap || u.length > 200;
+        if (u.length > 200) u = [u substringToIndex:200];
+        return more ? [u stringByAppendingString:@"…"] : u;
+    }
+    NSData *h = d.length > 32 ? [d subdataWithRange:NSMakeRange(0, 32)] : d;
+    return hexOf(h);
 }
+// 输出 hex 预览:引擎取全部 output 的 hex 前 16 字符(8 字节)(dh_log_json.m:119-124)。
 static NSString *outHexPreview(NSData *d) {
     if (!d.length) return @"";
-    return hexOf([d subdataWithRange:NSMakeRange(0, MIN(d.length, (NSUInteger)24))]);
+    NSString *oh = hexOf(d);
+    return oh.length > 16 ? [oh substringToIndex:16] : oh;
 }
 static NSData *b64(NSString *s) {
     if (![s isKindOfClass:[NSString class]] || !s.length) return nil;
@@ -246,6 +261,83 @@ static NSString *fmtTs(long long ms) {
 }
 static long long jint(id v) { return [v isKindOfClass:[NSNumber class]] ? [v longLongValue] : 0; }
 static NSString *jstr(id v) { return [v isKindOfClass:[NSString class]] ? v : @""; }
+
+// 复刻引擎 dh_net_split_detail(src/server/dh_log_json.m:22-98):把网络类(DHCategoryNetwork=6)的
+// detail 拆成 req/resp/err/status。cap.jsonl 里网络条目的 detail 是引擎原始格式(companion dh_cap_emit
+// 原样存),collector 要像引擎 summary/detail 那样拆分,列表才有 statusCode/netError、详情才有 responseDetail。
+// 严格照引擎实现,两种格式:① \x1e(RS)三段分隔;② legacy "> "/"< "/"-- " 行前缀。改任一方两处同步。
+static void netSplitDetail(NSString *detail, NSString **outReq, NSString **outResp,
+                           NSString **outErr, NSInteger *outStatus) {
+    if (outReq) *outReq = @"";
+    if (outResp) *outResp = @"";
+    if (outErr) *outErr = @"";
+    if (outStatus) *outStatus = 0;
+    if (!detail.length) return;
+
+    if ([detail rangeOfString:@"\x1e"].location != NSNotFound) {
+        NSArray *parts = [detail componentsSeparatedByString:@"\x1e"];
+        if (outReq) *outReq = parts.count > 0 ? parts[0] : @"";
+        if (outResp) *outResp = parts.count > 1 ? parts[1] : @"";
+        if (outErr) *outErr = parts.count > 2 ? parts[2] : @"";
+        NSString *resp = outResp ? *outResp : @"";
+        NSString *first = [[resp componentsSeparatedByString:@"\n"] firstObject] ?: @"";
+        if (outStatus) *outStatus = first.integerValue;
+        return;
+    }
+
+    BOOL legacy = NO;
+    for (NSString *ln in [detail componentsSeparatedByString:@"\n"]) {
+        if ([ln hasPrefix:@"> "] || [ln hasPrefix:@"< "] || [ln hasPrefix:@"-- "]) { legacy = YES; break; }
+    }
+    if (!legacy) { if (outReq) *outReq = detail; return; }
+
+    NSMutableArray *reqH = [NSMutableArray array];
+    NSMutableArray *respH = [NSMutableArray array];
+    NSString *reqLine = @"";
+    NSInteger status = 0;
+    NSString *err = @"";
+    BOOL inReq = NO, inResp = NO;
+    NSArray *lines = [detail componentsSeparatedByString:@"\n"];
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        NSString *ln = lines[i];
+        if (i == 0) { reqLine = ln ?: @""; continue; }
+        if ([ln hasPrefix:@"-- "]) {
+            if ([ln rangeOfString:@"Status:"].location != NSNotFound) {
+                NSRange r = [ln rangeOfCharacterFromSet:[NSCharacterSet decimalDigitCharacterSet]];
+                if (r.location != NSNotFound) status = [[ln substringFromIndex:r.location] integerValue];
+                inReq = NO; inResp = NO;
+            } else if ([ln rangeOfString:@"Error:"].location != NSNotFound) {
+                NSRange er = [ln rangeOfString:@"Error:"];
+                err = [[ln substringFromIndex:er.location + 6]
+                       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                inReq = NO; inResp = NO;
+            } else if ([ln rangeOfString:@"Request Header"].location != NSNotFound
+                       || [ln isEqualToString:@"-- Headers --"]) {
+                inReq = YES; inResp = NO;
+            } else if ([ln rangeOfString:@"Response Header"].location != NSNotFound) {
+                inReq = NO; inResp = YES;
+            } else {
+                inReq = NO; inResp = NO;
+            }
+            continue;
+        }
+        if ([ln hasPrefix:@"> "]) { [reqH addObject:[ln substringFromIndex:2]]; continue; }
+        if ([ln hasPrefix:@"< "]) { [respH addObject:[ln substringFromIndex:2]]; continue; }
+        if (inReq && [ln rangeOfString:@": "].location != NSNotFound) [reqH addObject:ln];
+        else if (inResp && [ln rangeOfString:@": "].location != NSNotFound) [respH addObject:ln];
+    }
+
+    NSMutableString *req = [NSMutableString stringWithString:reqLine];
+    if (req.length && ![req hasSuffix:@"\n"]) [req appendString:@"\n"];
+    for (NSString *h in reqH) [req appendFormat:@"%@\n", h];
+    NSMutableString *resp = [NSMutableString string];
+    if (status > 0) [resp appendFormat:@"%ld\n", (long)status];
+    for (NSString *h in respH) [resp appendFormat:@"%@\n", h];
+    if (outReq) *outReq = req;
+    if (outResp) *outResp = resp;
+    if (outErr) *outErr = err;
+    if (outStatus) *outStatus = status;
+}
 
 // ———— 载入 cap.jsonl → 归一化(去重 + tsMs 排序 + 赋稳定 _seq)————
 static NSString *capPath(NSString *proc) { return [NSString stringWithFormat:@"/var/log/dh-%@.cap.jsonl", proc]; }
@@ -313,29 +405,54 @@ static NSArray<NSDictionary *> *loadEntries(NSString *proc) {
 static NSDictionary *listItem(NSDictionary *r) {
     NSInteger cat = (NSInteger)jint(r[@"cat"]);
     NSData *in = b64(r[@"in"]), *out = b64(r[@"out"]);
-    return @{
+    NSString *detail = jstr(r[@"detail"]);
+    NSNumber *statusCode = nil; NSString *netErr = nil;
+    if (cat == 6 && detail.length) {   // DHCategoryNetwork=6(见 kCategoryNames):拆网络 detail,detail 只留请求部分(照引擎 summary)
+        NSString *req = nil, *resp = nil, *err = nil; NSInteger st = 0;
+        netSplitDetail(detail, &req, &resp, &err, &st);
+        detail = req ?: @"";
+        if (st > 0) statusCode = @(st);
+        if (err.length) netErr = err;
+    }
+    NSMutableDictionary *m = [@{
         @"seq": r[@"_seq"] ?: @0,
         @"category": @(cat), @"categoryName": catName(cat),
-        @"algorithm": jstr(r[@"algo"]), @"operation": jstr(r[@"op"]), @"detail": jstr(r[@"detail"]),
+        @"algorithm": jstr(r[@"algo"]), @"operation": jstr(r[@"op"]), @"detail": detail,
         @"timestampMs": @(jint(r[@"tsMs"])), @"timestamp": fmtTs(jint(r[@"tsMs"])),
         @"threadId": @(jint(r[@"tid"])),
         @"inLen": @(jint(r[@"inLen"])), @"outLen": @(jint(r[@"outLen"])),
         @"preview": inPreview(in), @"outputHexPreview": outHexPreview(out),
-    };
+    } mutableCopy];
+    if (statusCode) m[@"statusCode"] = statusCode;
+    if (netErr) m[@"netError"] = netErr;
+    return m;
 }
 static NSDictionary *detailItem(NSDictionary *r) {
     NSMutableDictionary *d = [listItem(r) mutableCopy];
     NSData *in = b64(r[@"in"]), *out = b64(r[@"out"]);
     d[@"callStack"] = jstr(r[@"cs"]);
-    d[@"input"] = @(in.length); d[@"inputHex"] = hexOf(in); d[@"inputDump"] = hexdumpOf(in);
+    // input/output 用原始长度(inLen/outLen);hex/dump 是 companion 截断到 8192 的内容,超出补 truncated 标记。
+    // (引擎全量详情里 input==inLen 恒成立;这里用原长对齐,避免 input 显截断值而与 inLen 自相矛盾)
+    long long inLen = jint(r[@"inLen"]), outLen = jint(r[@"outLen"]);
+    d[@"input"] = @(inLen); d[@"inputHex"] = hexOf(in); d[@"inputDump"] = hexdumpOf(in);
+    if (inLen > (long long)in.length) d[@"inputTruncated"] = @YES;
     { NSString *u = utf8Of(in); if (u) d[@"inputUtf8"] = u; }
-    d[@"output"] = @(out.length); d[@"outputHex"] = hexOf(out); d[@"outputDump"] = hexdumpOf(out);
+    d[@"output"] = @(outLen); d[@"outputHex"] = hexOf(out); d[@"outputDump"] = hexdumpOf(out);
+    if (outLen > (long long)out.length) d[@"outputTruncated"] = @YES;
     { NSString *u = utf8Of(out); if (u) d[@"outputUtf8"] = u; }
     // crypto 料(仅捕获到才有)
     NSData *key = b64(r[@"key"]), *iv = b64(r[@"iv"]);
     if (key.length) { d[@"key"] = @(key.length); d[@"keyHex"] = hexOf(key); }
     if (iv.length)  { d[@"iv"]  = @(iv.length);  d[@"ivHex"]  = hexOf(iv); }
     if ([r[@"pki"] isKindOfClass:[NSString class]] && [r[@"pki"] length]) d[@"publicKeyInfo"] = r[@"pki"];
+    // 网络类(cat==6):补 responseDetail(照引擎 dh_log_entry_detail:201-206,拆出响应部分)
+    NSInteger cat = (NSInteger)jint(r[@"cat"]);
+    NSString *rawDetail = jstr(r[@"detail"]);
+    if (cat == 6 && rawDetail.length) {
+        NSString *req = nil, *resp = nil, *err = nil; NSInteger st = 0;
+        netSplitDetail(rawDetail, &req, &resp, &err, &st);
+        if (resp.length) d[@"responseDetail"] = resp;
+    }
     return d;
 }
 static NSString *deviceModel(void) {
