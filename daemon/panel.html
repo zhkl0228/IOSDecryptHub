@@ -114,7 +114,7 @@ async function loadA(){
   _fridaAvail = !!a.fridaAvail;
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
-        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" onclick="unlockDev()">解锁/亮屏</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
+        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" onclick="unlockDev()">解锁/亮屏</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
       + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" onclick="keepFg(\'\')">关闭保持前台</button></div>'
       + '<div id="atbl"></div>'
       + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
@@ -128,6 +128,11 @@ async function loadA(){
     var lk=a.locked, on=a.screenOn;   // lk: 1锁 0解 -1未知
     var t = lk===1?"🔒 锁屏" : (lk===0?"🟢 已解锁" : (on?"亮屏":"息屏"));
     sc.textContent = t + " · " + (on?"亮":"息") + (lk===-1?"(装 DHUnlock 显示锁屏态)":"");
+  }
+  var bt=document.getElementById("batt");
+  if(bt){
+    var bv=a.battery;   // 0-100,-1未知
+    bt.textContent = (typeof bv==="number"&&bv>=0) ? ((a.charging?"⚡ ":"🔋 ")+bv+"%") : "未知";
   }
   renderA();
 }

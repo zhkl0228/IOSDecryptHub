@@ -101,6 +101,42 @@ static float dh_screen_brightness(void) {
     });
     return bget ? bget() : -1.0f;
 }
+// 电量:IOKit IOPowerSources(惰性 dlopen,root daemon 直接调,不依赖 DHUnlock)。返回 0-100 百分比,
+// -1=拿不到。*charging 回填是否在充电。字段名(Current/Max Capacity、Is Charging)设备探针实测确认存在。
+static int dh_battery_level(int *charging) {
+    static CFTypeRef (*Info)(void); static CFArrayRef (*List)(CFTypeRef);
+    static CFDictionaryRef (*Desc)(CFTypeRef, CFTypeRef); static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+        if (h) {
+            Info = (CFTypeRef (*)(void))dlsym(h, "IOPSCopyPowerSourcesInfo");
+            List = (CFArrayRef (*)(CFTypeRef))dlsym(h, "IOPSCopyPowerSourcesList");
+            Desc = (CFDictionaryRef (*)(CFTypeRef, CFTypeRef))dlsym(h, "IOPSGetPowerSourceDescription");
+        }
+    });
+    if (charging) *charging = 0;
+    if (!Info || !List || !Desc) return -1;
+    CFTypeRef blob = Info();
+    if (!blob) return -1;
+    int pct = -1;
+    CFArrayRef list = List(blob);
+    if (list && CFArrayGetCount(list) > 0) {
+        CFDictionaryRef d = Desc(blob, CFArrayGetValueAtIndex(list, 0));  // Get:不 release
+        if (d) {
+            int cur = -1, max = -1;
+            CFNumberRef cn = CFDictionaryGetValue(d, CFSTR("Current Capacity"));
+            CFNumberRef mn = CFDictionaryGetValue(d, CFSTR("Max Capacity"));
+            if (cn) CFNumberGetValue(cn, kCFNumberIntType, &cur);
+            if (mn) CFNumberGetValue(mn, kCFNumberIntType, &max);
+            if (max > 0 && cur >= 0) pct = cur * 100 / max;
+            CFBooleanRef ch = CFDictionaryGetValue(d, CFSTR("Is Charging"));
+            if (charging && ch) *charging = CFBooleanGetValue(ch) ? 1 : 0;
+        }
+    }
+    if (list) CFRelease(list);   // Copy:要 release
+    CFRelease(blob);             // Copy:要 release
+    return pct;
+}
 // 锁屏状态:读 DHUnlock 写的 /var/jb/tmp/dh_lockstate("1"锁/"0"解);无文件(没装 DHUnlock)返回 -1=未知。
 // collector 读不到 SpringBoard 的 SBLockScreenManager,精确锁屏态由 SpringBoard 里的 DHUnlock 落文件转达。
 static int dh_screen_locked(void) {
@@ -616,11 +652,15 @@ static NSDictionary *controlAppData(void) {
     NSString *fgShow = haveFm ? (fmName.length ? fmName : fmBundle)
                               : [fgNames componentsJoinedByString:@" / "];
     float bright = dh_screen_brightness();
+    int charging = 0;
+    int batt = dh_battery_level(&charging);
     return @{ @"apps": out, @"engineVer": @ENGINE_VER,
               @"fgKeep": fgKeep ?: @"",
               @"foreground": fgShow,
               @"screenOn": @(bright > 0.0f),        // 亮屏/息屏(collector 直接读亮度)
               @"locked": @(dh_screen_locked()),     // 1=锁屏 0=已解锁 -1=未知(没装 DHUnlock)
+              @"battery": @(batt),                  // 电量 0-100,-1=拿不到
+              @"charging": @(charging != 0),        // 是否在充电
               @"fridaAvail": @(dh_frida_available()) };  // 装了 Frida 才显示 web 上的 Frida 功能
 }
 // App 重启=结束进程(iOS App 非 launchd KeepAlive,kill 后由用户/系统重新打开时带上新注入)。按枚举到的
