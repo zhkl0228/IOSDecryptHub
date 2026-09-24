@@ -5,10 +5,10 @@
 //   故本组件由 ElleKit 按 Filter Bundles=com.apple.springboard 注入 SpringBoard。
 //
 // 解锁流程严格照 rp.dylib 逆向(IDA:lockStateChanged→tryUnlockDevice__block_invoke),缺一步就不生效:
-//   1. 通知回调收到后 dispatch_after 3 秒到【主队列】才动手——等锁屏状态稳定,且 UI 操作必须主线程
+//   1. 通知回调收到后 dispatch_after 1.5 秒到【主队列】才动手——等锁屏状态稳定,且 UI 操作必须主线程(rp 原 3s,收紧到 1.5s)
 //      (曾经在通知回调线程直接裸调 unlockUIFromSource,日志显示"已执行"但 locked 仍为 1,就是没在主线程)。
 //   2. 主线程:[SBLockScreenManager sharedInstance] isUILocked → unlockUIFromSource:0 withOptions:nil。
-//   3. 再 dispatch_after 2 秒主队列:[UIApplication sharedApplication] setIdleTimerDisabled:YES
+//   3. 再 dispatch_after 1 秒主队列:[UIApplication sharedApplication] setIdleTimerDisabled:YES
 //      + 模拟按 HOME 键去桌面(只解锁不去桌面会停在锁屏下的界面)。app 即 SpringBoard(UIApplication 子类),
 //      调 _simulateHomeButtonPressWithCompletion:(系统合成 HOME 事件,不依赖物理键,Face ID 设备/新系统同样有效;
 //      设备 DSC 实证存在),级联兜底 rp 原版的 _returnToHomeScreenWithCompletion:。见 dh_do_unlock_main。
@@ -98,13 +98,13 @@ static void dh_do_unlock_main(const char *reason) {
     if (!((BOOL (*)(id, SEL))objc_msgSend)(mgr, sel_getUid("isUILocked"))) return;   // 已解锁不动
     ((void (*)(id, SEL, long, id))objc_msgSend)(mgr, sel_getUid("unlockUIFromSource:withOptions:"), 0, nil);
     syslog(LOG_NOTICE, UNLOCK_TAG " unlockUIFromSource:0(主线程,%s)", reason);
-    // 2 秒后模拟按 HOME 键 + 关自动锁屏。
+    // 1 秒后模拟按 HOME 键 + 关自动锁屏。
     // 「按 HOME 键」用 SpringBoard(app 即 UIApplication 子类)的 _simulateHomeButtonPressWithCompletion::
     // 由系统合成 HOME 事件,不依赖物理 HOME 键——无物理键(Face ID)设备与新系统一样有效(设备 DSC 实证存在)。
     // 前台 App 走标准 进入后台/挂起 生命周期、转场系统原生。级联兜底 _returnToHomeScreenWithCompletion:
     // (rp 原版的程序化回主屏,同样通用):未来系统若无前者,退到它仍能回主屏。两条都打 NOTICE 记走哪条;
     // 两者都探不到才 LOG_ERR(fail-loud,不静默)——拿到那条日志即知该系统要换新的回主屏 API。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class ua = objc_getClass("UIApplication");
         if (!ua) return;
         id app = dh_msg0((id)ua, "sharedApplication");
@@ -171,9 +171,9 @@ static void dh_do_lock_main(const char *reason) {
     });
 }
 
-// 通知回调 → 延迟 3 秒到【主队列】(照 rp:等锁屏稳定 + UI 必须主线程)。
+// 通知回调 → 延迟 1.5 秒到【主队列】(等锁屏状态稳定 + UI 必须主线程;rp 原用 3s,本 fork 收紧到 1.5s)。
 static void dh_schedule_unlock(const char *reason) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dh_do_unlock_main(reason);
     });
 }
