@@ -136,8 +136,8 @@ async function loadA(){
     if(lk===0){ pb.textContent="🔒 锁屏"; pb.dataset.mode="lock"; }
     else { pb.textContent="解锁/亮屏"; pb.dataset.mode="unlock"; }
   }
-  var hb=document.getElementById("homebtn");   // 回桌面:仅解锁时显示(锁屏时回不了桌面)
-  if(hb) hb.style.display = (lk===0) ? "" : "none";
+  var hb=document.getElementById("homebtn");   // 回桌面:仅解锁 且 有前台 App 时显示(已在桌面/锁屏都没意义)
+  if(hb) hb.style.display = (lk===0 && a.foreground && a.foreground.length) ? "" : "none";
   var cf=document.getElementById("closefgbtn");   // 关闭保持前台:仅设了保持前台目标时才显示
   if(cf) cf.style.display = (a.fgKeep && a.fgKeep.length) ? "" : "none";
   var bt=document.getElementById("batt");
