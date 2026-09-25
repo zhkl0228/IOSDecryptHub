@@ -49,6 +49,7 @@ extern int  dh_task_suspend_count(int pid);                     // collector.c:t
 // SpringBoard 里的 DHUnlock 读 foregroundKeep:非空即在锁屏时自动解锁(两者绑定,无单独开关)。
 #define DH_UNLOCK_NOTIFY  "com.iosdecrypthub.unlock"   // 手动解锁 darwin 通知(DHUnlock 监听)
 #define DH_LOCK_NOTIFY    "com.iosdecrypthub.lock"     // 手动锁屏 darwin 通知(DHUnlock 监听)
+#define DH_HOME_NOTIFY    "com.iosdecrypthub.home"     // 手动回桌面 darwin 通知(DHUnlock 按 HOME)
 #define DH_FRIDA_DIR   @"/var/jb/usr/lib/IOSDecryptHub/frida"   // Frida JS 脚本目录(<bundle>.js)
 #define DH_FRIDA_REQ   @"/var/jb/tmp/dh-frida-req"              // 写 bundle id → dh_frida daemon spawn+注入
 #define DH_FRIDA_INJ_DIR @"/var/jb/tmp/dh-frida-inj"            // dh_frida 注入成功写 <bundle>=pid;读它判"当前实例是否已注入"
@@ -924,6 +925,23 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
     if ([action isEqualToString:@"lock"]) {
         notify_post(DH_LOCK_NOTIFY);
         sendJSON(fd, @{@"ok": @YES, @"notified": @YES}); return;
+    }
+    // 回桌面:发 darwin 通知让 SpringBoard 里的 DHUnlock 按一次 HOME(dh_press_home_main)。仅解锁时有意义
+    // (锁屏时在锁屏界面,回不了桌面),故锁屏直接拒;web 端也只在解锁时才显示此按钮。
+    if ([action isEqualToString:@"home"]) {
+        if (dh_screen_locked() == 1) { sendJSON(fd, @{@"ok": @NO, @"err": @"设备锁屏,先解锁"}); return; }
+        notify_post(DH_HOME_NOTIFY);
+        sendJSON(fd, @{@"ok": @YES, @"notified": @YES}); return;
+    }
+    // 切前台:亮屏 + uiopen 把某 App 切到前台(运行中的后台 App 即切前台,未运行则启动)。
+    // 仅设备已解锁才支持——锁屏时 App 上不来(和冷启同理),故锁屏直接拒(web 端也只在解锁时才显示此按钮)。
+    if ([action isEqualToString:@"foreground"]) {
+        NSString *bundle = q[@"bundle"];
+        if (![bundle isKindOfClass:[NSString class]] || !validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+        if (dh_screen_locked() == 1) { sendJSON(fd, @{@"ok": @NO, @"err": @"设备锁屏,先解锁再切前台"}); return; }
+        dh_undim_screen();
+        BOOL ok = launchApp(bundle);
+        sendJSON(fd, @{@"ok": @(ok), @"note": ok ? @"已切前台" : @"切前台失败"}); return;
     }
     send404(fd);
 }

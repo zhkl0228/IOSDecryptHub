@@ -27,6 +27,7 @@
 //   com.apple.springboard.lockstate  系统锁屏状态变化 → 若设了 foregroundKeep 则(延迟)自动解锁
 //   com.iosdecrypthub.unlock         collector 手动解锁通知(点 web「解锁」即发,无条件解一次)
 //   com.iosdecrypthub.lock           collector 手动锁屏通知(点 web「锁屏」即发,无条件锁一次)
+//   com.iosdecrypthub.home           collector 手动回桌面通知(点 web「回桌面」即发,按一次 HOME;仅解锁时)
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -89,6 +90,32 @@ static void dh_write_frontmost(void) {
     [bid writeToFile:DH_FRONTMOST_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+// 【主队列】模拟按 HOME 键去桌面。用 SpringBoard(app 即 UIApplication 子类)的
+// _simulateHomeButtonPressWithCompletion::由系统合成 HOME 事件,不依赖物理 HOME 键——无物理键(Face ID)
+// 设备与新系统一样有效(设备 DSC 实证存在);前台 App 走标准 进入后台/挂起 生命周期、转场系统原生。
+// 级联兜底 _returnToHomeScreenWithCompletion:(rp 原版程序化回主屏,同样通用)。两条都打 NOTICE 记走哪条;
+// 两者都探不到才 LOG_ERR(fail-loud)。解锁流程与 web「回桌面」按钮共用。
+static void dh_press_home_main(const char *reason) {
+    Class ua = objc_getClass("UIApplication");
+    if (!ua) return;
+    id app = dh_msg0((id)ua, "sharedApplication");
+    if (!app) return;
+    SEL simHome = sel_getUid("_simulateHomeButtonPressWithCompletion:");
+    SEL retHome = sel_getUid("_returnToHomeScreenWithCompletion:");
+    if ([app respondsToSelector:simHome]) {
+        id done = [^{} copy];
+        ((void (*)(id, SEL, id))objc_msgSend)(app, simHome, done);
+        syslog(LOG_NOTICE, UNLOCK_TAG " 模拟按 HOME 键(_simulateHomeButtonPressWithCompletion:,%s)", reason);
+    } else if ([app respondsToSelector:retHome]) {
+        id done = [^{} copy];
+        ((void (*)(id, SEL, id))objc_msgSend)(app, retHome, done);
+        syslog(LOG_NOTICE, UNLOCK_TAG " 回主屏(_returnToHomeScreenWithCompletion:;无 HOME 模拟,%s)", reason);
+    } else {
+        syslog(LOG_ERR, UNLOCK_TAG " 无 _simulateHomeButtonPressWithCompletion:/_returnToHomeScreenWithCompletion:"
+                        "(respondsToSelector 均 0)——该系统需换回主屏 API,HOME(%s)未触发", reason);
+    }
+}
+
 // 【主队列】真正解锁 + 按 HOME 键去桌面(解锁步骤照 rp tryUnlockDevice;去桌面本 fork 改为模拟 HOME 键)。
 static void dh_do_unlock_main(const char *reason) {
     Class cls = objc_getClass("SBLockScreenManager");
@@ -98,32 +125,12 @@ static void dh_do_unlock_main(const char *reason) {
     if (!((BOOL (*)(id, SEL))objc_msgSend)(mgr, sel_getUid("isUILocked"))) return;   // 已解锁不动
     ((void (*)(id, SEL, long, id))objc_msgSend)(mgr, sel_getUid("unlockUIFromSource:withOptions:"), 0, nil);
     syslog(LOG_NOTICE, UNLOCK_TAG " unlockUIFromSource:0(主线程,%s)", reason);
-    // 1 秒后模拟按 HOME 键 + 关自动锁屏。
-    // 「按 HOME 键」用 SpringBoard(app 即 UIApplication 子类)的 _simulateHomeButtonPressWithCompletion::
-    // 由系统合成 HOME 事件,不依赖物理 HOME 键——无物理键(Face ID)设备与新系统一样有效(设备 DSC 实证存在)。
-    // 前台 App 走标准 进入后台/挂起 生命周期、转场系统原生。级联兜底 _returnToHomeScreenWithCompletion:
-    // (rp 原版的程序化回主屏,同样通用):未来系统若无前者,退到它仍能回主屏。两条都打 NOTICE 记走哪条;
-    // 两者都探不到才 LOG_ERR(fail-loud,不静默)——拿到那条日志即知该系统要换新的回主屏 API。
+    // 1 秒后关自动锁屏 + 模拟按 HOME 键去桌面(只解锁不去桌面会停在锁屏下的界面)。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class ua = objc_getClass("UIApplication");
-        if (!ua) return;
-        id app = dh_msg0((id)ua, "sharedApplication");
-        if (!app) return;
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(app, sel_getUid("setIdleTimerDisabled:"), YES);
-        SEL simHome = sel_getUid("_simulateHomeButtonPressWithCompletion:");
-        SEL retHome = sel_getUid("_returnToHomeScreenWithCompletion:");
-        if ([app respondsToSelector:simHome]) {
-            id done = [^{} copy];
-            ((void (*)(id, SEL, id))objc_msgSend)(app, simHome, done);
-            syslog(LOG_NOTICE, UNLOCK_TAG " 模拟按 HOME 键(_simulateHomeButtonPressWithCompletion:)+ setIdleTimerDisabled:YES");
-        } else if ([app respondsToSelector:retHome]) {
-            id done = [^{} copy];
-            ((void (*)(id, SEL, id))objc_msgSend)(app, retHome, done);
-            syslog(LOG_NOTICE, UNLOCK_TAG " 回主屏(_returnToHomeScreenWithCompletion:;无 HOME 模拟)+ setIdleTimerDisabled:YES");
-        } else {
-            syslog(LOG_ERR, UNLOCK_TAG " SpringBoard 无 _simulateHomeButtonPressWithCompletion:/_returnToHomeScreenWithCompletion:"
-                            "(respondsToSelector 均 0)——该系统需换回主屏 API,HOME 本次未触发");
-        }
+        id app = ua ? dh_msg0((id)ua, "sharedApplication") : nil;
+        if (app) ((void (*)(id, SEL, BOOL))objc_msgSend)(app, sel_getUid("setIdleTimerDisabled:"), YES);
+        dh_press_home_main("unlock");
     });
     dh_write_lockstate_async();   // 解锁后刷新状态文件
 }
@@ -198,6 +205,12 @@ static void manual_lock_cb(CFNotificationCenterRef center, void *observer,
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
     dispatch_async(dispatch_get_main_queue(), ^{ dh_do_lock_main("manual"); });
 }
+// collector 手动回桌面通知:点了 web「回桌面」即按一次 HOME。仅解锁时有意义(collector 侧已按锁屏态拒/隐藏)。
+static void manual_home_cb(CFNotificationCenterRef center, void *observer,
+                           CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{ dh_press_home_main("manual"); });
+}
 
 __attribute__((constructor))
 static void dh_unlock_init(void) {
@@ -211,6 +224,8 @@ static void dh_unlock_init(void) {
         CFSTR("com.iosdecrypthub.unlock"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(dc, NULL, manual_lock_cb,
         CFSTR("com.iosdecrypthub.lock"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(dc, NULL, manual_home_cb,
+        CFSTR("com.iosdecrypthub.home"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     // 初始锁屏状态延迟到主 runloop(SpringBoard 就绪)再写;绝不在此同步碰 SBLockScreenManager。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dh_write_lockstate_async();
