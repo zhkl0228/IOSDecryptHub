@@ -988,6 +988,26 @@ static int try_bind(uint16_t port) {
     return fd;
 }
 
+// 监听 socket 失效后重绑(本地 bind 模式专用)。App 转后台被挂起时 iOS 会回收其监听 socket,释放该端口;
+// 回前台后老 fd 上的 accept 返回 EBADF/EINVAL/ENOTSOCK。此时重跑 try_bind(8088-8108)拿新端口(老端口可能已被
+// 后启的 App 占走 → 拿到不同号),更新 gListenFD/gPort/gURL。这样悬浮窗(读 dh_http_port)与 collector(读 loader
+// 持续同步的 g_dh_app_reg.port)都不再显示过期端口,两个 App 也自然分到不同端口。成功返回新 fd,失败 -1。
+static int dh_http_rebind(void) {
+    int old = gListenFD;
+    for (uint16_t p = DH_HTTP_PORT_FIRST; p <= DH_HTTP_PORT_LAST; p++) {
+        int fd = try_bind(p);
+        if (fd >= 0) {
+            gListenFD = fd; gPort = p;
+            gURL = [NSString stringWithFormat:@"http://%@:%u/", get_local_ip(), (unsigned)p];
+            if (old >= 0) close(old);
+            NSLog(@"[IOSDecryptHub] HTTP 监听 socket 失效, 已重绑: %@", gURL);
+            return fd;
+        }
+    }
+    NSLog(@"[IOSDecryptHub] HTTP 重绑失败: 8088..8108 全被占用");
+    return -1;
+}
+
 static void accept_loop(void) {
     useconds_t backoff = 0;
     while (gListenFD >= 0) {
@@ -997,6 +1017,11 @@ static void accept_loop(void) {
         if (cfd < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             if (gListenFD < 0) break;
+            // 监听 socket 被系统回收(挂起后)→ accept 返回 EBADF/EINVAL/ENOTSOCK:重绑拿新端口再续 accept。
+            if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) {
+                if (dh_http_rebind() < 0) usleep(200 * 1000);   // 重绑不成(端口全占)→退避重试
+                continue;
+            }
             // EMFILE/ENFILE: fd 耗尽, 指数退避避免 100% CPU
             if (errno == EMFILE || errno == ENFILE) {
                 backoff = backoff ? MIN(backoff * 2, (useconds_t)500 * 1000) : 50 * 1000;

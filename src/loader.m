@@ -134,11 +134,13 @@ struct dh_app_reg g_dh_app_reg __attribute__((used));
 
 // dlopen 引擎后:等 dh_http_port() 就绪(引擎 HTTP server 异步 bind)→ 填 g_dh_app_reg(bundle/port/pid,
 // 最后置 magic)。引擎版本无导出 getter,留空由 collector 用 ENGINE_VER。
+// 填完不退出,而是每 3s 跟随 dh_http_port():App 后台被挂起后回前台,引擎会重绑到新端口
+// (见 http_server dh_http_rebind),这里同步更新 g_dh_app_reg.port,collector 才不会读到过期端口。
 static void *dh_app_reg_fill(void *arg) {
     void *handle = arg;
     int (*port_fn)(void) = (int (*)(void))dlsym(handle, "dh_http_port");
     uint32_t port = 0;
-    for (int i = 0; i < 120; i++) {   // ≤12s 等 bind
+    for (int i = 0; i < 120; i++) {   // ≤12s 等首次 bind
         if (port_fn) port = (uint32_t)port_fn();
         if (port) break;
         usleep(100000);
@@ -149,7 +151,17 @@ static void *dh_app_reg_fill(void *arg) {
     g_dh_app_reg.pid = (uint32_t)getpid();
     __sync_synchronize();
     g_dh_app_reg.magic = DH_APP_REG_MAGIC;   // 最后置:collector 扫到 magic 时其余字段已写好
-    return NULL;
+    // 持续跟随引擎重绑后的新端口(否则悬浮窗随引擎更新了,collector 仍显示老端口)。
+    for (;;) {
+        sleep(3);
+        if (!port_fn) continue;
+        uint32_t np = (uint32_t)port_fn();
+        if (np && np != g_dh_app_reg.port) {
+            g_dh_app_reg.port = np;
+            __sync_synchronize();
+        }
+    }
+    return NULL;   // 不会到达
 }
 
 __attribute__((constructor))

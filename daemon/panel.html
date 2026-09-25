@@ -153,9 +153,12 @@ function renderA(){
   document.getElementById("acnt").textContent = list.length+" 个";
   var h = '<table><tr><th>App</th><th>PID</th><th>保持前台</th><th>注入</th><th>运行</th><th>引擎</th><th>操作</th></tr>';
   list.forEach(function(x){
+    // 已注入 + 有端口(App 未挂起、引擎在服务)才给「连活引擎」链接;挂起时 port=0,只标「已注入(挂起)」不给链接
+    // ——挂起的 App 引擎被冻结、端口已过期/被别的 App 占,链接连过去是错的。
     var eng = !x.injected ? '<span class="off">—</span>'
-            : '<span class="on">已注入</span> '+(x.version?esc(x.version):'')
-              +' <a class="btn" href="http://'+H+':'+x.port+'/" target="_blank">连活引擎 :'+x.port+'</a>';
+            : (x.port>0 ? '<span class="on">已注入</span> '+(x.version?esc(x.version):'')
+                          +' <a class="btn" href="http://'+H+':'+x.port+'/" target="_blank">连活引擎 :'+x.port+'</a>'
+                        : '<span class="on">已注入</span> '+(x.version?esc(x.version):'')+' <span class="muted">(挂起)</span>');
     var run = x.running ? (x.foreground?'<span class="on">前台</span>':'<span class="off">后台</span>') : '<span class="off">未运行</span>';
     h += '<tr><td>'+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
       +  '<div class="muted">'+esc(x.bundle)+'</div></td>'

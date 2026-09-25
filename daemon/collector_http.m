@@ -769,7 +769,9 @@ static NSDictionary *controlAppData(void) {
                           @"keepFg": @([bundle isEqualToString:fgKeep]),
                           @"fridaJS": @([[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]),
                           @"injected": @(injected),
-                          @"port": injected ? pe[0] : @0,
+                          // 端口仅在 App 未挂起(sc==0,活跃)时给:挂起的 App 引擎被冻结、监听 socket 已被
+                          // 系统回收(端口可能被别的 App 占走),此时"连活引擎"链接必然过期/连到别人,故不显示。
+                          @"port": (injected && sc == 0) ? pe[0] : @0,
                           @"version": injected ? ([pe[1] length] ? pe[1] : @ENGINE_VER) : @"" }];
     }
     // 有 DHUnlock:显示真 frontmost 名(列表里没匹配到就退回 bundle id);无 DHUnlock:suspend==0 的名(可能多个)
