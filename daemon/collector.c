@@ -180,6 +180,30 @@ static void target_ensure_lan(target_t *t) {
     pthread_mutex_unlock(&t->lock);
 }
 
+// 引擎日志(.log)/ 结构化捕获(.cap.jsonl)文件轮转:这两类是无限追加的,daemon 长跑会涨到几十 MB
+// (实测 lockdownd.cap.jsonl 17.5MB),既占磁盘、也拖慢 collector 侧流式读。超过 CAP_FILE_MAX 就**原地压缩**:
+// 只保留末尾 CAP_FILE_KEEP(丢更早的),从第一个换行后开始以免文件头留半行。由写入方(本 append fd)自己做,
+// 避免和别的 fd 的 O_APPEND offset 打架;fd 需以 O_RDWR 打开(要 pread 读尾)。丢的是历史,近况完整保留。
+#define CAP_FILE_MAX  (8 * 1024 * 1024)
+#define CAP_FILE_KEEP (4 * 1024 * 1024)
+static void logfile_rotate_if_big(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= (off_t)CAP_FILE_MAX) return;
+    char *buf = malloc(CAP_FILE_KEEP);
+    if (!buf) return;
+    off_t start = st.st_size - (off_t)CAP_FILE_KEEP;
+    ssize_t rd = pread(fd, buf, CAP_FILE_KEEP, start);
+    if (rd > 0) {
+        ssize_t s = 0; while (s < rd && buf[s] != '\n') s++;   // 跳到第一个换行后,不在文件头留半行
+        if (s < rd) s++;
+        if (ftruncate(fd, 0) == 0) {                            // 清空后 O_APPEND write 从 0 写起
+            ssize_t off = 0, len = rd - s;
+            while (off < len) { ssize_t w = write(fd, buf + s + off, (size_t)(len - off)); if (w <= 0) break; off += w; }
+        }
+    }
+    free(buf);
+}
+
 // DH_CONN_LOG:引擎日志字节流(companion 把引擎的 NSFileHandle 接到这条连接)。
 // daemon 自己的 sandbox 写不了任何文件目录,collector 是 root、能写 /var/log,替它落盘。
 // companion→collector 的字节流(引擎日志 DH_CONN_LOG 或结构化捕获 DH_CONN_CAP)落盘。
@@ -199,7 +223,7 @@ static void *file_reader(void *arg) {
     if (safe[0] == 0) { close(fd); return NULL; }
     char path[160];
     snprintf(path, sizeof path, "/var/log/dh-%s%s", safe, suffix);
-    int out = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int out = open(path, O_RDWR | O_CREAT | O_APPEND, 0644);   // O_RDWR:轮转要 pread 读尾
     if (out < 0) { logts("[collector] 落盘文件打开失败 %s errno=%d", path, errno); close(fd); return NULL; }
     logts("[collector] %s 落盘 -> %s", safe, path);
     char buf[8192];
@@ -207,6 +231,7 @@ static void *file_reader(void *arg) {
     while ((n = read(fd, buf, sizeof buf)) > 0) {
         ssize_t off = 0;
         while (off < n) { ssize_t w = write(out, buf + off, (size_t)(n - off)); if (w <= 0) break; off += w; }
+        logfile_rotate_if_big(out);   // 超阈值原地压缩,防无限增长
     }
     close(out);
     close(fd);
@@ -498,10 +523,10 @@ static void *mb_log_thread(void *arg) {
     safe[j] = 0;
     if (safe[0] == 0) return NULL;
     char path[128]; snprintf(path, sizeof path, "/var/log/dh-%s.log", safe);
-    int out = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int out = open(path, O_RDWR | O_CREAT | O_APPEND, 0644);   // O_RDWR:轮转要 pread 读尾
     if (out < 0) { logts("[collector] %s 内存桥日志打开失败 %s errno=%d", safe, path, errno); return NULL; }
     char cpath[160]; snprintf(cpath, sizeof cpath, "/var/log/dh-%s.cap.jsonl", safe);
-    int capf = open(cpath, O_WRONLY | O_CREAT | O_APPEND, 0644);   // 结构化捕获(可选,失败不致命)
+    int capf = open(cpath, O_RDWR | O_CREAT | O_APPEND, 0644);   // 结构化捕获(可选,失败不致命);O_RDWR 供轮转
     logts("[collector] %s 内存桥落盘 -> %s%s", safe, path, capf >= 0 ? " (+cap.jsonl)" : "(cap open 失败)");
     uint64_t base = t->shm;
     uint32_t ltail = 0, ctail = 0;
@@ -514,6 +539,8 @@ static void *mb_log_thread(void *arg) {
                      offsetof(dh_shm_t, log_ring), DH_LOG_RING_SZ, &ltail, out) != 0) break;
         if (capf >= 0 && mb_drain(t->task, base, offsetof(dh_shm_t, cap_head), offsetof(dh_shm_t, cap_tail),
                                   offsetof(dh_shm_t, cap_ring), DH_CAP_RING_SZ, &ctail, capf) != 0) break;
+        logfile_rotate_if_big(out);                       // 超阈值原地压缩,防无限增长
+        if (capf >= 0) logfile_rotate_if_big(capf);
         usleep(200000);   // 200ms 轮询
     }
     close(out);

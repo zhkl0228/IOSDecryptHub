@@ -349,7 +349,10 @@ static NSString *capPath(NSString *proc) { return [NSString stringWithFormat:@"/
 // 拷贝),会随文件增长撑爆 collector 的默认 jetsam 内存上限被 SIGKILL(实测 lockdownd 2.4MB 即触发,
 // 前台无此限则不崩)。改流式:NSFileHandle 分块读、复用行缓冲逐行解析,峰值只跟单行 + 结果集走;再对
 // 超大文件只读末尾(防 104MB 那种跑飞)。@autoreleasepool 每块回收行内临时对象。
-#define CAP_READ_MAX (4ull * 1024 * 1024)
+// cap.jsonl 单次聚合最多读末尾这么多:collector jetsam 上限仅 6MB,而 loadEntries 会把这段原始 JSON
+// 解析成一堆行对象常驻内存(约 3x 膨胀)。4MB tail 解析出 ~12MB 必爆,故收到 1MB(解析后约 3MB,留足基线余量)。
+// 代价:每个 daemon 的聚合 /api 只覆盖最近 1MB 捕获;更早的在 cap.jsonl 里但不进本次查询。
+#define CAP_READ_MAX (1ull * 1024 * 1024)
 static NSArray<NSDictionary *> *loadEntries(NSString *proc) {
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:capPath(proc)];
     if (!fh) return @[];
@@ -617,9 +620,18 @@ static BOOL isWhitelisted(NSString *proc) {
 static NSUInteger capLineCount(NSString *proc) {
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:capPath(proc)];
     if (!fh) return 0;
-    NSUInteger n = 0; NSData *c;
-    while ((c = [fh readDataOfLength:(1u << 16)]).length)
-        { const uint8_t *b = c.bytes; for (NSUInteger i = 0; i < c.length; i++) if (b[i] == '\n') n++; }
+    NSUInteger n = 0;
+    // 每块都套 @autoreleasepool:否则每次 readDataOfLength 返回的 autoreleased 64KB NSData 会全堆在 pool 里
+    // 不释放,累积到接近整个 cap.jsonl 大小——collector jetsam 上限仅 6MB,daemon tab 逐 daemon 调本函数,
+    // 大 cap.jsonl 会直接顶爆被杀。加 pool 后内存持平(同时只留一块 64KB)。
+    while (1) {
+        @autoreleasepool {
+            NSData *c = [fh readDataOfLength:(1u << 16)];
+            if (c.length == 0) break;   // 从 pool 块里 break 到 while 合法,pool 正常 drain
+            const uint8_t *b = c.bytes;
+            for (NSUInteger i = 0; i < c.length; i++) if (b[i] == '\n') n++;
+        }
+    }
     return n;
 }
 // 控制台 daemon 列表:白名单 × {enabled(config), state(live/idle/dead), version, latest, count, port}。
@@ -1076,6 +1088,8 @@ static void handleConn(int fd) {
             NSString *bundle = parseQuery(query)[@"bundle"];
             if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
             if (![[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]) { sendJSON(fd, @{@"ok": @NO, @"err": @"该 App 未设置 Frida JS"}); return; }
+            // 启动注入=frida spawn 冷启该 App,需设备解锁(锁屏 spawn 拉不起真进程);锁屏直接拒。
+            if (dh_screen_locked() == 1) { sendJSON(fd, @{@"ok": @NO, @"err": @"设备锁屏,先解锁再启动注入"}); return; }
             BOOL w = [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
             sendJSON(fd, @{@"ok": @(w), @"note": @"已请求 dh_frida spawn+注入(需 frida-server + dh_frida daemon)"}); return;
         }
@@ -1207,7 +1221,8 @@ static void *fgKeepThread(void *arg) {
                     //    kill 后写 req 让 dh_frida spawn 冷启并注入(与 web「重启」同路)。frida 未就绪则不动——
                     //    避免白闪一下也注入不了(用户明确要求)。lastRestartPid 防对同一未注入 pid 反复 kill。
                     BOOL restarted = NO;
-                    if ([[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)] && dh_frida_ready()) {
+                    // 锁屏时不 kill 重注:spawn 冷启需解锁,锁屏 kill 了也拉不起来,白杀。
+                    if ([[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)] && dh_frida_ready() && dh_screen_locked() != 1) {
                         int injPid = fridaInjectedPid(bundle);
                         if (pid != injPid && pid != lastRestartPid) {
                             aggLog([NSString stringWithFormat:@"[fg-keep] %@ 运行中但未注入 frida(pid %d,注入记录 %d),kill 后 spawn 重注入", bundle, pid, injPid]);

@@ -115,7 +115,7 @@ async function loadA(){
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
         '<div class="row-actions" style="margin-bottom:8px"><button class="btn" id="pwrbtn" data-mode="unlock" onclick="pwrToggle()">解锁/亮屏</button> <button class="btn" id="homebtn" onclick="goHome()" style="display:none">回桌面</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
-      + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" onclick="keepFg(\'\')">关闭保持前台</button></div>'
+      + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" id="closefgbtn" onclick="keepFg(\'\')" style="display:none">关闭保持前台</button></div>'
       + '<div id="atbl"></div>'
       + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
       + '(App 引擎 WebUI 只在 App 前台时活、后台被 iOS 挂起,故不做「连活引擎」,从引擎悬浮窗看 ip:port 访问。)<br>'
@@ -138,6 +138,8 @@ async function loadA(){
   }
   var hb=document.getElementById("homebtn");   // 回桌面:仅解锁时显示(锁屏时回不了桌面)
   if(hb) hb.style.display = (lk===0) ? "" : "none";
+  var cf=document.getElementById("closefgbtn");   // 关闭保持前台:仅设了保持前台目标时才显示
+  if(cf) cf.style.display = (a.fgKeep && a.fgKeep.length) ? "" : "none";
   var bt=document.getElementById("batt");
   if(bt){
     var bv=a.battery;   // 0-100,-1未知
@@ -172,8 +174,9 @@ function renderA(){
       +  '<td>'+run+'</td>'
       +  '<td>'+eng+'</td>'
       +  '<td>'
+      // 切前台/重启/启动都靠 uiopen,锁屏时上不来,故仅解锁(_locked===0)时显示;Frida(编辑脚本)不受锁屏影响,保留。
       +      ((x.running && _locked===0 && !x.foreground) ? '<button class="btn" onclick="toFg(\''+esc(x.bundle)+'\')" title="uiopen 切到前台(仅解锁时)">切前台</button> ' : '')
-      +      '<button class="btn'+((x.fridaJS&&_fridaAvail)?' inj':'')+'" onclick="rstA(\''+esc(x.bundle)+'\')" title="'+((x.fridaJS&&_fridaAvail)?'重启并注入 Frida JS':'普通重启(uiopen)')+'">'+(x.running?'重启':'启动')+'</button> '
+      +      (_locked!==1 ? '<button class="btn'+((x.fridaJS&&_fridaAvail)?' inj':'')+'" onclick="rstA(\''+esc(x.bundle)+'\')" title="'+((x.fridaJS&&_fridaAvail)?'重启并注入 Frida JS':'普通重启(uiopen)')+'">'+(x.running?'重启':'启动')+'</button> ' : '')
       +      (_fridaAvail?'<button class="btn" onclick="fridaEdit(\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')">Frida'+(x.fridaJS?' ●':'')+'</button>':'')+'</td></tr>';
   });
   if(!list.length) h += '<tr><td class="muted" colspan="7">无匹配</td></tr>';
@@ -249,6 +252,8 @@ function fmtFridaMsg(m){
   return JSON.stringify(m);
 }
 async function fridaLogPoll(b){
+  // 「保存并启动注入」= spawn 冷启,仅解锁可用:锁屏(_locked===1)时隐藏该按钮(弹窗开着时每 1.5s 跟随)。
+  var lb=document.getElementById("fridalaunchbtn"); if(lb) lb.style.display=(_locked===1)?"none":"";
   try{
     var j = await (await fetch("/api/frida/log?bundle="+encodeURIComponent(b)+"&limit=300")).json();
     var el=document.getElementById("flog"); if(!el) return;
@@ -270,7 +275,7 @@ async function fridaEdit(b,name){
     +'<textarea id="fjs" spellcheck="false" placeholder="// frida 脚本,例: console.log(Process.id); Interceptor.attach(...)"></textarea>'
     +'<div class="frow"><label class="btn">上传 JS<input type="file" accept=".js,.txt,text/javascript" style="display:none" onchange="fridaUpload(this)"></label>'
     +'<button class="btn" onclick="fridaSave(\''+esc(b)+'\')">保存</button>'
-    +'<button class="btn" onclick="fridaLaunch(\''+esc(b)+'\')">保存并启动注入</button>'
+    +'<button class="btn" id="fridalaunchbtn" onclick="fridaLaunch(\''+esc(b)+'\')">保存并启动注入</button>'
     +'<button class="btn" onclick="fridaDelete(\''+esc(b)+'\')">清空脚本</button>'
     +'<button class="btn" onclick="fridaClose()">关闭</button><span class="muted" id="fmsg"></span></div>'
     +'<div class="muted" style="margin-top:8px">启动注入 = frida spawn 该 App → resume → attach → 注入此 JS(需 frida-server + IOSDecryptHubFrida daemon)。</div>'
@@ -288,6 +293,7 @@ async function fridaSave(b){
   }catch(e){ var m=document.getElementById("fmsg"); if(m)m.textContent="网络错误"; return false; }
 }
 async function fridaLaunch(b){
+  if(_locked===1){ var m=document.getElementById("fmsg"); if(m)m.textContent="设备锁屏,先解锁再启动注入"; return; }  // 启动注入=spawn 冷启,需解锁
   if(!(await fridaSave(b))) return;
   try{ var j=await (await fetch("/api/frida/launch?bundle="+encodeURIComponent(b),{method:"POST"})).json();
     document.getElementById("fmsg").textContent=j.ok?"已请求启动注入(看设备)":("失败:"+(j.err||""));
