@@ -138,18 +138,14 @@ variant, for injectors) plus the rootless and roothide debs.
 ./scripts/publish_release.sh
 ```
 
-Or let CI do it — bump `VERSION` in `Makefile`, push to main, then:
-
-```bash
-git tag v1.27.6 && git push origin v1.27.6
-```
-
-`.github/workflows/release.yml` builds and creates the Release. Release notes come from
-`.github/release-notes/<version>.md` when present (preferred), otherwise from commit
-subjects. `build.yml` only compiles on push/PR and uploads artifacts — it never publishes.
-
-Both workflows verify that the tag matches `VERSION` in the `Makefile`, and CI skips
-entirely when a Release for that tag already exists, so publishing locally first is safe.
+> This fork **disables automatic cloud builds**: `build.yml` / `release.yml` under
+> `.github/workflows/` are **manual-only** (`workflow_dispatch`) — pushing to main / PR / a
+> tag will **not** trigger them (this fork always builds locally via `make deb`, and CI lacks
+> the frida devkit so it can't build everything anyway). Release via the local
+> `publish_release.sh` above; if you really want the cloud path, go to Actions → pick the
+> workflow → Run workflow (release takes a version that must match `VERSION` in `Makefile`).
+> Release notes come from `.github/release-notes/<version>.md` when present, otherwise from
+> commit subjects.
 
 ## Repository layout
 

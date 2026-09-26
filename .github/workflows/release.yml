@@ -2,9 +2,9 @@ name: Release
 
 # 发布链路（公开仓自持，不再依赖任何私有仓）。
 #
-# 触发方式：
-#   1) 推 tag：  git tag v1.27.6 && git push origin v1.27.6
-#   2) 手动：    Actions → Release → Run workflow，填版本号（不带 v）
+# 本 fork 已禁用推 tag 自动发版，只保留手动触发：
+#   Actions → Release → Run workflow，填版本号（不带 v）
+# （fork 一般用本地 scripts/publish_release.sh 发版；云端这条留作可选手动入口。）
 #
 # 若该 tag 的 Release 已经存在（例如本地用 scripts/publish_release.sh 先发过了），
 # 本工作流会直接跳过，不会重复构建或报错。
@@ -18,8 +18,6 @@ name: Release
 # 没有则用上一个 tag 到当前的提交标题自动生成。
 
 on:
-  push:
-    tags: [ 'v*' ]
   workflow_dispatch:
     inputs:
       version:

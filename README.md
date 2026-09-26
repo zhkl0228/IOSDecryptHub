@@ -138,18 +138,12 @@ make test-updater
 ./scripts/publish_release.sh
 ```
 
-也可以交给 CI —— 先改 `Makefile` 里的 `VERSION` 并推 main，再：
-
-```bash
-git tag v1.27.6 && git push origin v1.27.6
-```
-
-`.github/workflows/release.yml` 会自动编译并创建 Release；Release 说明优先读
-`.github/release-notes/<version>.md`（建议手写），没有则用提交标题自动生成。
-`build.yml` 只在推 main / PR 时做编译验证，不发 Release。
-
-两个工作流都会校验 tag 版本与 `Makefile` 的 `VERSION` 一致；CI 发现该 tag 的 Release
-已存在时会跳过，所以本地发过之后再推 tag 也不会重复构建。
+> 本 fork 已**禁用云端自动构建**：`.github/workflows/` 下的 `build.yml` / `release.yml`
+> 只保留手动触发(`workflow_dispatch`),推 main / PR / tag 都**不会**自动跑
+> (fork 一直本地 `make deb` 出包,且云端缺 frida devkit 也构建不全)。发版用上面的
+> `publish_release.sh` 本地一键即可;若确要云端跑,去 Actions → 选对应 workflow →
+> Run workflow(release 需填版本号,与 `Makefile` 的 `VERSION` 一致)。Release 说明优先读
+> `.github/release-notes/<version>.md`(建议手写),没有则用提交标题自动生成。
 
 ## 仓库结构
 
