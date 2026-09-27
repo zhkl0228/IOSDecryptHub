@@ -55,6 +55,8 @@ extern int  dh_task_suspend_count(int pid);                     // collector.c:t
 #define DH_FRIDA_INJ_DIR @"/var/jb/tmp/dh-frida-inj"            // dh_frida 注入成功写 <bundle>=pid;读它判"当前实例是否已注入"
 static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
 static NSString *fridaJsPath(NSString *bundle);   // fwd(Frida JS 路径,定义在 handleControl 前)
+static NSString *fgExecForBundle(NSString *bundle);   // fwd(bundle→exec,定义在 fgKeepThread 附近)
+static int fridaInjectedPid(NSString *bundle);   // fwd(dh_frida 注入记录的 pid,定义在 fgKeepThread 附近)
 // 门控 config 读:key 下的数组是否含 val。key = DH_KEY_EXECS(daemon)/ DH_KEY_BUNDLES(App)。
 static BOOL cfgHasMember(NSString *key, NSString *val) {
     NSArray *a = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
@@ -951,9 +953,22 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         NSString *bundle = q[@"bundle"];
         if (![bundle isKindOfClass:[NSString class]] || !validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
         if (dh_screen_locked() == 1) { sendJSON(fd, @{@"ok": @NO, @"err": @"设备锁屏,先解锁再切前台"}); return; }
+        // 已在运行 + 配了 frida JS + 当前实例未注入 + frida 就绪 → 先请 dh_frida 对该 pid attach 注入
+        // (不 kill、不闪、不打断 App;attach 错过启动早期,运行中 hooks 生效),再切前台。
+        NSString *exec = fgExecForBundle(bundle);
+        int pid = exec.length ? dh_proc_alive([exec UTF8String]) : 0;
+        BOOL attachReq = NO;
+        if (pid > 0
+            && [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]
+            && dh_frida_ready()
+            && pid != fridaInjectedPid(bundle)) {
+            NSString *req = [NSString stringWithFormat:@"attach:%@:%d", bundle, pid];
+            attachReq = [req writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
         dh_undim_screen();
         BOOL ok = launchApp(bundle);
-        sendJSON(fd, @{@"ok": @(ok), @"note": ok ? @"已切前台" : @"切前台失败"}); return;
+        sendJSON(fd, @{@"ok": @(ok), @"frida": @(attachReq),
+                       @"note": ok ? (attachReq ? @"已切前台 + 已请求 frida attach 注入" : @"已切前台") : @"切前台失败"}); return;
     }
     send404(fd);
 }

@@ -82,7 +82,36 @@ static gchar *read_file(const char *path) {
     return buf;
 }
 
-// 主动 spawn 目标 App + 注入其 JS。session/script 不 unref(保持注入,直到目标退出)。
+// 对已在运行的 pid attach + 注入 JS(spawn 与 attach 两路共用)。session/script 不 unref(保持注入,直到目标退出)。
+static void inject_pid(const gchar *bundle, guint pid, const gchar *js) {
+    GError *e = NULL;
+    FridaSession *sess = frida_device_attach_sync(g_dev, pid, NULL, NULL, &e);
+    if (e) { frida_error(bundle, "attach", e->message); goto done; }
+    g_signal_connect(sess, "detached", G_CALLBACK(on_detached), g_strdup(bundle));   // 崩溃/断开落 jsonl
+
+    FridaScriptOptions *opt = frida_script_options_new();
+    frida_script_options_set_name(opt, "dh-frida");
+    frida_script_options_set_runtime(opt, FRIDA_SCRIPT_RUNTIME_QJS);
+    FridaScript *scr = frida_session_create_script_sync(sess, js, opt, NULL, &e);
+    g_clear_object(&opt);
+    if (e) { frida_error(bundle, "create_script", e->message); goto done; }   // 语法/编译错误
+    g_signal_connect(scr, "message", G_CALLBACK(on_message), g_strdup(bundle));   // ud=bundle(session 保持,不释放)
+    frida_script_load_sync(scr, NULL, &e);
+    if (e) { frida_error(bundle, "load", e->message); goto done; }   // 加载错误
+    syslog(LOG_NOTICE, FRIDA_TAG " %s pid=%u 注入成功(script 保持)", bundle, pid);
+    // 记下"该 bundle 已注入到 pid":collector 据此判断当前运行实例是否已注入(不符则未注入)。
+    {
+        mkdir(INJ_DIR, 0755);
+        gchar *inj_path = g_strdup_printf("%s/%s", INJ_DIR, bundle);
+        FILE *ip = fopen(inj_path, "w");
+        if (ip) { fprintf(ip, "%u", pid); fclose(ip); }
+        g_free(inj_path);
+    }
+done:
+    g_clear_error(&e);
+}
+
+// 主动 spawn 目标 App + 注入其 JS(冷启,启动即注入)。
 static void spawn_inject(const gchar *bundle) {
     GError *e = NULL;
     gchar *js_path = g_strdup_printf("%s/%s.js", JS_DIR, bundle);
@@ -101,50 +130,65 @@ static void spawn_inject(const gchar *bundle) {
     if (e) { frida_error(bundle, "resume", e->message); goto done; }
     g_usleep(RESUME_DELAY_US);   // 挂起 attach 本环境不通,resume 后等 App 起来再 attach
 
-    FridaSession *sess = frida_device_attach_sync(g_dev, pid, NULL, NULL, &e);
-    if (e) { frida_error(bundle, "attach", e->message); goto done; }
-    g_signal_connect(sess, "detached", G_CALLBACK(on_detached), g_strdup(bundle));   // 崩溃/断开落 jsonl
-
-    FridaScriptOptions *opt = frida_script_options_new();
-    frida_script_options_set_name(opt, "dh-frida");
-    frida_script_options_set_runtime(opt, FRIDA_SCRIPT_RUNTIME_QJS);
-    FridaScript *scr = frida_session_create_script_sync(sess, js, opt, NULL, &e);
-    g_clear_object(&opt);
-    if (e) { frida_error(bundle, "create_script", e->message); goto done; }   // 语法/编译错误
-    g_signal_connect(scr, "message", G_CALLBACK(on_message), g_strdup(bundle));   // ud=bundle(session 保持,不释放)
-    frida_script_load_sync(scr, NULL, &e);
-    if (e) { frida_error(bundle, "load", e->message); goto done; }   // 加载错误
-    syslog(LOG_NOTICE, FRIDA_TAG " %s pid=%u 注入成功(script 保持)", bundle, pid);
-    // 记下"该 bundle 已注入到 pid":collector 的保持前台监控据此判断——若目标 App 当前运行的 pid 与此不符
-    // (比如用户点图标冷启的新实例),说明是未注入实例,frida 就绪时会 kill+重新 spawn 注入。
-    {
-        mkdir(INJ_DIR, 0755);
-        gchar *inj_path = g_strdup_printf("%s/%s", INJ_DIR, bundle);
-        FILE *ip = fopen(inj_path, "w");
-        if (ip) { fprintf(ip, "%u", pid); fclose(ip); }
-        g_free(inj_path);
-    }
-    // 故意不 unref sess/scr:保持注入直到目标退出(detach 会 unload)。daemon 注入次数少,可接受。
+    inject_pid(bundle, pid, js);
 done:
     g_clear_error(&e);
     g_free(js);
     g_free(js_path);
 }
 
-// 轮询请求文件:collector 写一行 bundle id → 处理 → 删。
+// attach 模式:App 已在运行(如「切前台」把它拉上前台),对它 attach 注入——不 kill、不闪、不打断当前 App,
+// 只是错过启动早期(运行中 hooks 生效)。供 collector 的「切前台」对已运行未注入的 App 补注入。
+static void attach_inject(const gchar *bundle, guint pid) {
+    gchar *js_path = g_strdup_printf("%s/%s.js", JS_DIR, bundle);
+    gchar *js = read_file(js_path);
+    if (!js) {
+        syslog(LOG_ERR, FRIDA_TAG " 无 JS 脚本 %s,跳过 attach %s", js_path, bundle);
+        g_free(js_path);
+        return;
+    }
+    syslog(LOG_NOTICE, FRIDA_TAG " attach %s pid=%u (JS %ld 字节)...", bundle, pid, (long)strlen(js));
+    inject_pid(bundle, pid, js);
+    g_free(js);
+    g_free(js_path);
+}
+
+// 轮询请求文件:collector 写一行 → 处理 → 删。
+//   纯 bundle id        → spawn_inject(冷启+注入)
+//   attach:<bundle>:<pid> → attach_inject(App 已运行,attach 补注入;「切前台」用)
 static gboolean poll_req(gpointer ud) {
     if (access(REQ_FILE, F_OK) != 0) return TRUE;
     gchar *content = read_file(REQ_FILE);
     unlink(REQ_FILE);
     if (content) {
-        gchar *bundle = g_strstrip(content);
-        // 只允许 bundle id 字符集,防注入(内容来自 collector 写的文件,仍校验)
-        gboolean ok = *bundle != '\0';
-        for (const gchar *p = bundle; *p; p++) {
-            if (!(g_ascii_isalnum(*p) || *p == '.' || *p == '-' || *p == '_')) { ok = FALSE; break; }
+        gchar *line = g_strstrip(content);
+        if (g_str_has_prefix(line, "attach:")) {
+            // attach:<bundle>:<pid>
+            gchar *rest = line + 7;
+            gchar *colon = strrchr(rest, ':');
+            gboolean ok = colon != NULL && colon != rest;
+            guint pid = 0;
+            gchar *bundle = NULL;
+            if (ok) {
+                *colon = '\0';
+                bundle = rest;
+                pid = (guint)g_ascii_strtoull(colon + 1, NULL, 10);
+                ok = pid > 0;
+                for (const gchar *p = bundle; ok && *p; p++) {
+                    if (!(g_ascii_isalnum(*p) || *p == '.' || *p == '-' || *p == '_')) ok = FALSE;
+                }
+            }
+            if (ok) attach_inject(bundle, pid);
+            else syslog(LOG_ERR, FRIDA_TAG " 非法 attach 请求,忽略");
+        } else {
+            // 只允许 bundle id 字符集,防注入(内容来自 collector 写的文件,仍校验)
+            gboolean ok = *line != '\0';
+            for (const gchar *p = line; *p; p++) {
+                if (!(g_ascii_isalnum(*p) || *p == '.' || *p == '-' || *p == '_')) { ok = FALSE; break; }
+            }
+            if (ok) spawn_inject(line);
+            else syslog(LOG_ERR, FRIDA_TAG " 非法 bundle 请求,忽略");
         }
-        if (ok) spawn_inject(bundle);
-        else syslog(LOG_ERR, FRIDA_TAG " 非法 bundle 请求,忽略");
         g_free(content);
     }
     return TRUE;

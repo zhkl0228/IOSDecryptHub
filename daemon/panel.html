@@ -193,8 +193,8 @@ async function togA(b,on){
 }
 async function toFg(b){
   var r = await post("/api/control/foreground?bundle="+encodeURIComponent(b));
-  toast(r.ok ? "已切前台" : ("失败:"+(r.err||"")), !r.ok);
-  setTimeout(loadA, 1200);   // 刷新前台/运行状态
+  toast(r.ok ? (r.frida ? "已切前台 + 已请求 frida 注入(attach)" : "已切前台") : ("失败:"+(r.err||"")), !r.ok);
+  setTimeout(loadA, 1500);   // 刷新前台/运行/注入状态
 }
 async function rstA(b){
   toast("处理 "+b+" …");
