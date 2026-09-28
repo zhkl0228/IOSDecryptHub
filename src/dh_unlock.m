@@ -34,6 +34,7 @@
 #import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <syslog.h>
+#import <dlfcn.h>        // dlsym/RTLD_DEFAULT(UIImagePNGRepresentation)
 #import "dh_jbroot.h"   // rootful 兼容:运行时 jbroot 探测(本文件在 src/ 下,同目录引用)
 
 #define UNLOCK_TAG        "[DHUnlock]"
@@ -228,6 +229,62 @@ static void manual_home_cb(CFNotificationCenterRef center, void *observer,
     dispatch_async(dispatch_get_main_queue(), ^{ dh_press_home_main("manual"); });
 }
 
+// —— App 图标服务:collector(daemon)拿不到 UIKit 系统图标 API(_applicationIconImageForBundleIdentifier:
+// 的 category 只在完整 UI 环境注册,裸 dlopen UIKit 没有),故由 SpringBoard 进程内的本组件代取——
+// 与 manager 的 DHAppIcon 同一 API,图标必然一致。流程:collector 写 bundle id 到 /var/tmp/dh_icon_req
+// + notify → 本回调在主队列取图标 → PNG 写 /var/tmp/dh-icons/<bundle>.png(collector 轮询读)。
+#define DH_ICON_REQ @"/var/tmp/dh_icon_req"
+#define DH_ICON_DIR @"/var/tmp/dh-icons"
+#define DH_ICON_DBG @"/var/tmp/dh_icon_dbg"   // 诊断:syslog 抓不到时看这里(/var/tmp 人人可写)
+static void dh_icon_dbg(NSString *s) {
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:DH_ICON_DBG];
+    if (!fh) { [s writeToFile:DH_ICON_DBG atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    [fh seekToEndOfFile]; [fh writeData:[[s stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile];
+}
+static void dh_do_icon_main(void) {
+    NSString *bundle = [NSString stringWithContentsOfFile:DH_ICON_REQ encoding:NSUTF8StringEncoding error:nil];
+    bundle = [bundle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!bundle.length) return;
+    // 图标 API:与 manager 的 DHAppIcon 同族,但注意版本差异(实测 18.5/26.0 的 SpringBoard):
+    //   三参 _applicationIconImageForBundleIdentifier:format:scale: 在 SpringBoard/daemon 类环境可用(rts=1);
+    //   两参 _applicationIconImageForBundleIdentifier:scale:(manager 用的)只在 App 环境有(SpringBoard rts=0)。
+    // 故三参优先、两参兜底。format=1 + scale=2 → 80x80 PNG。
+    Class ui = objc_getClass("UIImage");
+    SEL sel3 = sel_getUid("_applicationIconImageForBundleIdentifier:format:scale:");
+    SEL sel2 = sel_getUid("_applicationIconImageForBundleIdentifier:scale:");
+    id img = nil;
+    if (ui && [ui respondsToSelector:sel3])
+        img = ((id (*)(id, SEL, id, long, CGFloat))objc_msgSend)((id)ui, sel3, bundle, 1L, 2.0);
+    if (!img && ui && [ui respondsToSelector:sel2])
+        img = ((id (*)(id, SEL, id, CGFloat))objc_msgSend)((id)ui, sel2, bundle, 2.0);
+    if (!img) {
+        dh_icon_dbg([NSString stringWithFormat:@"取图失败: %@(rts3=%d rts2=%d)", bundle,
+                     ui ? [ui respondsToSelector:sel3] : -1, ui ? [ui respondsToSelector:sel2] : -1]);
+        syslog(LOG_ERR, UNLOCK_TAG " 图标获取失败: %s", bundle.UTF8String);
+        return;
+    }
+    static NSData *(*pPng)(id) = NULL;
+    if (!pPng) pPng = (NSData *(*)(id))dlsym(RTLD_DEFAULT, "UIImagePNGRepresentation");
+    NSData *png = pPng ? pPng(img) : nil;
+    if (!png.length) {
+        dh_icon_dbg([NSString stringWithFormat:@"PNG 编码失败: %@", bundle]);
+        syslog(LOG_ERR, UNLOCK_TAG " 图标 PNG 编码失败: %s", bundle.UTF8String);
+        return;
+    }
+    [[NSFileManager defaultManager] createDirectoryAtPath:DH_ICON_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *out = [DH_ICON_DIR stringByAppendingPathComponent:[bundle stringByAppendingString:@".png"]];
+    if (![png writeToFile:out atomically:YES]) {
+        dh_icon_dbg([NSString stringWithFormat:@"写文件失败: %@", out]);
+        syslog(LOG_ERR, UNLOCK_TAG " 图标写文件失败: %s", out.UTF8String);
+    }
+}
+// collector 图标请求通知:读请求文件 → 主队列取图标写 png(UI 必须主线程)。
+static void icon_req_cb(CFNotificationCenterRef center, void *observer,
+                        CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{ dh_do_icon_main(); });
+}
+
 __attribute__((constructor))
 static void dh_unlock_init(void) {
     // Filter 已限定只注入 SpringBoard;再确认进程名,非 SpringBoard 直接不注册(双保险)。
@@ -242,6 +299,8 @@ static void dh_unlock_init(void) {
         CFSTR("com.iosdecrypthub.lock"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(dc, NULL, manual_home_cb,
         CFSTR("com.iosdecrypthub.home"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(dc, NULL, icon_req_cb,
+        CFSTR("com.iosdecrypthub.iconreq"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     // 初始锁屏状态延迟到主 runloop(SpringBoard 就绪)再写;绝不在此同步碰 SBLockScreenManager。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dh_write_lockstate_async();

@@ -28,9 +28,11 @@
 #import <signal.h>        // kill(App 重启=结束进程)
 #import <spawn.h>         // posix_spawn(uiopen 启动 App)
 #import <sys/wait.h>      // waitpid
+#import <sys/stat.h>      // chmod(图标目录 0777,SpringBoard 可写)
 #import <dlfcn.h>         // dlopen/dlsym(SBSUndimScreen 亮屏)
 #import <notify.h>        // notify_post(通知 SpringBoard 里的 DHUnlock 解锁)
 #import <mach/mach.h>     // mach_port_t / kern_return_t(IORegistry AppleSmartBattery 读电量)
+#import <objc/message.h>                // objc_msgSend
 #import "../src/dh_jbroot.h"   // rootful 兼容:运行时 jbroot 探测(rootless=/var/jb / rootful=真实根)
 extern char **environ;
 
@@ -1032,6 +1034,35 @@ static BOOL dumpStart(NSString *bundle, NSString **errOut) {
     });
     return YES;
 }
+
+// ———— App 图标(/api/icon):由 SpringBoard 里的 DHUnlock 代取(见 iconPngForBundle)————
+#define DH_ICON_DIR @"/var/tmp/dh-icons"
+
+// 取 App 图标 PNG(/var/tmp/dh-icons/<bundle>.png 缓存)。
+// daemon 里拿不到 UIKit 系统图标 API(_applicationIconImageForBundleIdentifier: 的 category 只在完整
+// UI 环境注册,裸 dlopen UIKit respondsToSelector=0,实测),故委托 SpringBoard 里的 DHUnlock 代取——
+// 与 manager 的 DHAppIcon 同一 API,图标必然一致。无缓存时:写 bundle 到请求文件 + notify,轮询等 png
+// (≤2s,请求全局串行);超时/拿不到就 404,panel 用字母头像占位(UI 占位,非图标回退)。
+static NSData *iconPngForBundle(NSString *bundle) {
+    // 目录必须 0777:png 由 SpringBoard(mobile 用户)写入,collector(root) 只读;root 建的 0755 会挡住 mobile。
+    [[NSFileManager defaultManager] createDirectoryAtPath:DH_ICON_DIR withIntermediateDirectories:YES
+                                               attributes:@{NSFilePosixPermissions: @(0777)} error:nil];
+    chmod(DH_ICON_DIR.fileSystemRepresentation, 0777);   // 已存在的 0755 旧目录也纠正
+    NSString *cache = [DH_ICON_DIR stringByAppendingPathComponent:[bundle stringByAppendingString:@".png"]];
+    NSData *png = [NSData dataWithContentsOfFile:cache];
+    if (png.length) return png;
+    static NSLock *reqLock; static dispatch_once_t ro;
+    dispatch_once(&ro, ^{ reqLock = [NSLock new]; });
+    [reqLock lock];
+    [bundle writeToFile:@"/var/tmp/dh_icon_req" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    notify_post("com.iosdecrypthub.iconreq");
+    for (int i = 0; i < 40 && !png.length; i++) {
+        usleep(50000);
+        png = [NSData dataWithContentsOfFile:cache];
+    }
+    [reqLock unlock];
+    return png;
+}
 // 智能启动(冷启动场景用):配了 Frida JS 且 frida 可用 → 写请求让 dh_frida frida spawn+注入;否则 uiopen。
 // 保持前台的退出自启、restart-app 都用它,保证配了 JS 的 App「启动即带 frida」。仅用于进程不在时(冷启动);
 // App 在运行时(后台拉回)不能用——frida spawn 是冷启动会冲突,那种情况用 launchApp(uiopen)激活。
@@ -1326,6 +1357,13 @@ static void handleConn(int fd) {
             }
             [fh closeFile];
             return;
+        }
+        if ([path isEqualToString:@"/api/icon"]) {
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { send404(fd); return; }
+            NSData *png = iconPngForBundle(bundle);
+            if (!png.length) { send404(fd); return; }
+            httpSend(fd, 200, "OK", "image/png", png); return;
         }
         // Frida:保存 JS(POST body=脚本)/ 读 JS(GET)/ 启动注入(POST 写请求文件,dh_frida daemon 执行)
         if ([path isEqualToString:@"/api/frida/save"]) {

@@ -38,6 +38,8 @@ a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
 #fjs{width:100%;height:52vh;box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px;font:13px/1.5 ui-monospace,Menlo,monospace}
 .frow{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #flog,#dlog{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.45 ui-monospace,Menlo,monospace;height:20vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
+.appicon{width:28px;height:28px;border-radius:6px;vertical-align:middle;margin-right:8px}
+.avatar{display:inline-block;width:28px;height:28px;border-radius:6px;color:#fff;text-align:center;line-height:28px;font-weight:600;font-size:14px;vertical-align:middle;margin-right:8px}
 #toast.show{opacity:1}
 .err{color:#e6788a}
 </style></head><body>
@@ -54,6 +56,30 @@ a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
 <script>
 var H = location.hostname;
 function esc(s){return (s==null?"":""+s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+// 字母头像(系统 daemon 无图标资源 / App 图标 404 兜底):首字母 + 名字 hash 色。
+function avatar(txt){
+  var s=(txt||'?')+'', ch=s.charAt(0).toUpperCase();
+  var h=0; for(var i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0;
+  return '<span class="avatar" style="background:hsl('+(h%360)+',45%,32%)">'+esc(ch)+'</span>';
+}
+// App 图标缓存:renderA 每 1.5s 全量重建 innerHTML,若每次都用 /api/icon 作 src,img 会重新加载/解码 → 闪烁。
+// 首次加载成功后转 dataURL 缓存(同源,canvas 可读),之后渲染走 dataURL 不闪;404 记 miss,直接用字母头像不再请求。
+var _iconCache={}, _iconMiss={};
+function iconHtml(x){
+  if(_iconMiss[x.bundle]) return avatar(x.name);
+  var du=_iconCache[x.bundle];
+  if(du) return '<img class="appicon" src="'+du+'">';
+  return '<img class="appicon" src="/api/icon?bundle='+encodeURIComponent(x.bundle)
+    +'" onload="iconLoaded(this,\''+esc(x.bundle)+'\')" onerror="iconMiss(this,\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')">';
+}
+function iconLoaded(img,b){
+  try{
+    var c=document.createElement('canvas'); c.width=img.naturalWidth; c.height=img.naturalHeight;
+    c.getContext('2d').drawImage(img,0,0);
+    _iconCache[b]=c.toDataURL('image/png');
+  }catch(e){}
+}
+function iconMiss(img,b,name){ _iconMiss[b]=1; img.outerHTML=avatar(name); }
 function toast(m,isErr){var t=document.getElementById("toast");t.innerHTML=isErr?'<span class="err">'+esc(m)+'</span>':esc(m);t.className="show";setTimeout(function(){t.className="";},2200);}
 function seltab(el){
   document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("sel");});
@@ -79,7 +105,7 @@ async function loadD(){
            : (!d.version ? '<span class="off">?</span>'
            : (d.latest ? esc(d.version) : '<span class="idle">'+esc(d.version)+' · 旧</span>'));
     var live = d.state=="live";
-    h += '<tr><td><a href="/d/'+encodeURIComponent(d.proc)+'/">'+esc(d.proc)+'</a>'
+    h += '<tr><td>'+avatar(d.disp)+'<a href="/d/'+encodeURIComponent(d.proc)+'/">'+esc(d.proc)+'</a>'
        +  '<div class="muted">'+esc(d.disp)+'</div></td>'
        +  '<td>'+pidCell(d.pid)+'</td>'
        +  '<td><label class="sw"><input type="checkbox" '+(d.enabled?"checked":"")
@@ -168,7 +194,7 @@ function renderA(){
                           +' <a class="btn" href="http://'+H+':'+x.port+'/" target="_blank">连活引擎 :'+x.port+'</a>'
                         : '<span class="on">已注入</span> '+(x.version?esc(x.version):'')+' <span class="muted">(挂起)</span>');
     var run = x.running ? (x.foreground?'<span class="on">前台</span>':'<span class="off">后台</span>') : '<span class="off">未运行</span>';
-    h += '<tr><td>'+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
+    h += '<tr><td>'+iconHtml(x)+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
       +  '<div class="muted">'+esc(x.bundle)+'</div></td>'
       +  '<td>'+pidCell(x.pid)+'</td>'
       +  '<td style="text-align:center"><input type="radio" name="fgk" '+(x.keepFg?'checked':'')+' onchange="keepFg(\''+esc(x.bundle)+'\')"></td>'
