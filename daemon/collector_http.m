@@ -31,6 +31,7 @@
 #import <dlfcn.h>         // dlopen/dlsym(SBSUndimScreen 亮屏)
 #import <notify.h>        // notify_post(通知 SpringBoard 里的 DHUnlock 解锁)
 #import <mach/mach.h>     // mach_port_t / kern_return_t(IORegistry AppleSmartBattery 读电量)
+#import "../src/dh_jbroot.h"   // rootful 兼容:运行时 jbroot 探测(rootless=/var/jb / rootful=真实根)
 extern char **environ;
 
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
@@ -42,7 +43,38 @@ extern int  dh_app_mem_read(int pid, uint32_t *port, char *bundle, size_t bcap, 
 extern int  dh_task_suspend_count(int pid);                     // collector.c:task suspend_count,>0=后台挂起 0=前台 <0=拿不到
 
 // 注入门控 config(companion dh_enabled / collector mb_is_enabled 都读这份;与它们同路径)。
-#define DH_CFG_PATH @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
+// 以下路径均 rootful 兼容:不再硬编码 /var/jb/...,运行时按 dh_jbroot() 拼(rootless 前缀
+// /var/jb,rootful 真实根);与 companion / DHUnlock 的拼法同源(dh_jbroot.h 单一真相源)。
+static NSString *dhCfgPath(void) {
+    char buf[128];
+    dh_jb_path(buf, sizeof buf, "/usr/lib/IOSDecryptHub/config/enabledBundles.plist");
+    return @(buf);
+}
+static NSString *dhFridaDir(void) {   // Frida JS 脚本目录(<bundle>.js)
+    char buf[96];
+    dh_jb_path(buf, sizeof buf, "/usr/lib/IOSDecryptHub/frida");
+    return @(buf);
+}
+static NSString *dhFridaReq(void) {   // 写 bundle id → dh_frida daemon spawn+注入
+    char buf[64];
+    dh_jb_path(buf, sizeof buf, "/tmp/dh-frida-req");
+    return @(buf);
+}
+static NSString *dhFridaInjDir(void) {   // dh_frida 注入成功写 <bundle>=pid;读它判"当前实例是否已注入"
+    char buf[64];
+    dh_jb_path(buf, sizeof buf, "/tmp/dh-frida-inj");
+    return @(buf);
+}
+static NSString *dhLockstateFile(void) {   // DHUnlock 写的锁屏状态("1"锁/"0"解),collector 读给 web 显示
+    char buf[64];
+    dh_jb_path(buf, sizeof buf, "/tmp/dh_lockstate");
+    return @(buf);
+}
+static NSString *dhFrontmostFile(void) {   // DHUnlock 写的真 frontmost bundle id(空=桌面/无)
+    char buf[64];
+    dh_jb_path(buf, sizeof buf, "/tmp/dh_frontmost");
+    return @(buf);
+}
 #define DH_KEY_EXECS   @"enabledExecutables"   // 系统 daemon 注入名单(按 exec 名)
 #define DH_KEY_BUNDLES @"enabledBundles"        // App 注入名单(按 bundle id)
 #define DH_KEY_FGKEEP  @"foregroundKeep"        // 「保持前台」目标 bundle id(单值;空/缺=关闭);独立于注入名单
@@ -50,41 +82,38 @@ extern int  dh_task_suspend_count(int pid);                     // collector.c:t
 #define DH_UNLOCK_NOTIFY  "com.iosdecrypthub.unlock"   // 手动解锁 darwin 通知(DHUnlock 监听)
 #define DH_LOCK_NOTIFY    "com.iosdecrypthub.lock"     // 手动锁屏 darwin 通知(DHUnlock 监听)
 #define DH_HOME_NOTIFY    "com.iosdecrypthub.home"     // 手动回桌面 darwin 通知(DHUnlock 按 HOME)
-#define DH_FRIDA_DIR   @"/var/jb/usr/lib/IOSDecryptHub/frida"   // Frida JS 脚本目录(<bundle>.js)
-#define DH_FRIDA_REQ   @"/var/jb/tmp/dh-frida-req"              // 写 bundle id → dh_frida daemon spawn+注入
-#define DH_FRIDA_INJ_DIR @"/var/jb/tmp/dh-frida-inj"            // dh_frida 注入成功写 <bundle>=pid;读它判"当前实例是否已注入"
 static BOOL validProc(NSString *p);   // fwd(定义在索引页附近)
 static NSString *fridaJsPath(NSString *bundle);   // fwd(Frida JS 路径,定义在 handleControl 前)
 static NSString *fgExecForBundle(NSString *bundle);   // fwd(bundle→exec,定义在 fgKeepThread 附近)
 static int fridaInjectedPid(NSString *bundle);   // fwd(dh_frida 注入记录的 pid,定义在 fgKeepThread 附近)
 // 门控 config 读:key 下的数组是否含 val。key = DH_KEY_EXECS(daemon)/ DH_KEY_BUNDLES(App)。
 static BOOL cfgHasMember(NSString *key, NSString *val) {
-    NSArray *a = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
+    NSArray *a = [NSDictionary dictionaryWithContentsOfFile:dhCfgPath()][key];
     return [a isKindOfClass:[NSArray class]] && [a containsObject:val];
 }
 static NSArray *cfgMembers(NSString *key) {
-    NSArray *a = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
+    NSArray *a = [NSDictionary dictionaryWithContentsOfFile:dhCfgPath()][key];
     return [a isKindOfClass:[NSArray class]] ? a : @[];
 }
 // 读改写:保留其它 key 与同 key 里其它成员,只加/删本 val(整份覆写会互抹 enabledBundles/Executables,见 memory)。
 static BOOL cfgSetMember(NSString *key, NSString *val, BOOL on) {
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:dhCfgPath()] mutableCopy] ?: [NSMutableDictionary dictionary];
     NSMutableArray *a = [([d[key] isKindOfClass:[NSArray class]] ? d[key] : @[]) mutableCopy];
     BOOL has = [a containsObject:val];
     if (on && !has) [a addObject:val];
     else if (!on && has) [a removeObject:val];
     d[key] = a;
-    return [d writeToFile:DH_CFG_PATH atomically:YES];
+    return [d writeToFile:dhCfgPath() atomically:YES];
 }
 // 单值(字符串)config 读写:用于 foregroundKeep(单个 bundle)。读改写保留其它 key(同 cfgSetMember 顾虑)。
 static NSString *cfgGetScalar(NSString *key) {
-    id v = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH][key];
+    id v = [NSDictionary dictionaryWithContentsOfFile:dhCfgPath()][key];
     return [v isKindOfClass:[NSString class]] ? v : @"";
 }
 static BOOL cfgSetScalar(NSString *key, NSString *val) {
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:dhCfgPath()] mutableCopy] ?: [NSMutableDictionary dictionary];
     if (val.length) d[key] = val; else [d removeObjectForKey:key];   // 空=清除(关闭保持前台)
-    return [d writeToFile:DH_CFG_PATH atomically:YES];
+    return [d writeToFile:dhCfgPath() atomically:YES];
 }
 
 // 亮屏:惰性 dlopen SpringBoardServices 的 SBSUndimScreen(实测 collector root 可调)。无密码设备上 uiopen
@@ -107,11 +136,24 @@ static float dh_screen_brightness(void) {
     });
     return bget ? bget() : -1.0f;
 }
-// 电量:IORegistry AppleSmartBattery(惰性 dlopen IOKit,root 直接读;SpringBoard/BatteryCenter 底层
-// 也读它)。返回 0-100 百分比 = CurrentCapacity/MaxCapacity(MaxCapacity=100 时即 CurrentCapacity,
-// 精确到 1%、与系统 UI 一致),-1=拿不到。*charging 回填是否在充电(IsCharging bool)。
-// 不用 IOPSCopyPowerSourcesInfo:它的 Current Capacity 被 iOS 量化到 5%(90/85/80),粗。
-// 字段(CurrentCapacity/MaxCapacity/IsCharging)设备探针实测确认。
+// 通用取整数字段:CFNumber 直读,CFBoolean 转 0/1,缺失/其它类型 -1。
+static int dh_batt_int_prop(CFDictionaryRef d, CFStringRef key) {
+    CFTypeRef v = d ? CFDictionaryGetValue(d, key) : NULL;
+    if (!v) return -1;
+    if (CFGetTypeID(v) == CFNumberGetTypeID()) { int i = -1; return CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &i) ? i : -1; }
+    if (CFGetTypeID(v) == CFBooleanGetTypeID()) return CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
+    return -1;
+}
+// 电量:只读 IOPMPowerSource 节点(AppleSmartBattery 驱动发布的电池数据节点,惰性 dlopen IOKit,
+// root 直接读;SpringBoard/BatteryCenter 底层同读它)。iOS 17 起该节点按 entitlement 对无权限
+// 进程隐藏——匹配直接返回 0(实测 rootful iPad7,2/17.7.10:全枚举 814 个 IOService 无一电池类节点;
+// 而 IOPMrootDomain 可见 → 并非沙盒,是 user-client-class entitlement 门控;给 collector 签
+// com.apple.security.iokit-user-client-class=IOPMPowerSourceClient
+// (daemon/collector_entitlements.plist)后节点立即可见)。
+// CurrentCapacity/MaxCapacity 为原始精度(MaxCapacity=100 时 CurrentCapacity 即百分比,精确到 1%)。
+// 故意不做 5% 量化的 IOPSCopyPowerSourcesInfo 回退(产品决定:要么原始精度,要么显示未知):
+// 拿不到(节点被隐藏/entitlement 缺失/dylib 失败)返回 -1。
+// 字段(CurrentCapacity/MaxCapacity/IsCharging)均设备探针实测确认。
 static int dh_battery_level(int *charging) {
     static CFMutableDictionaryRef (*Matching)(const char *);
     static mach_port_t (*GetService)(mach_port_t, CFDictionaryRef);
@@ -129,36 +171,38 @@ static int dh_battery_level(int *charging) {
     });
     if (charging) *charging = 0;
     if (!Matching || !GetService || !CreateProps || !Release) return -1;
-    mach_port_t svc = GetService(0, Matching("AppleSmartBattery"));  // GetService 消费 matching 引用,不用 release
-    if (!svc) return -1;
     int pct = -1;
-    CFMutableDictionaryRef props = NULL;
-    if (CreateProps(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
-        int cur = -1, max = -1;
-        CFNumberRef cn = CFDictionaryGetValue(props, CFSTR("CurrentCapacity"));
-        CFNumberRef mn = CFDictionaryGetValue(props, CFSTR("MaxCapacity"));
-        if (cn) CFNumberGetValue(cn, kCFNumberIntType, &cur);
-        if (mn) CFNumberGetValue(mn, kCFNumberIntType, &max);
-        if (max > 0 && cur >= 0) pct = cur * 100 / max;   // MaxCapacity=100 时即精确 1% 百分比
-        CFBooleanRef ch = CFDictionaryGetValue(props, CFSTR("IsCharging"));
-        if (charging && ch && CFGetTypeID(ch) == CFBooleanGetTypeID()) *charging = CFBooleanGetValue(ch) ? 1 : 0;
-        CFRelease(props);
+    mach_port_t svc = GetService(0, Matching("IOPMPowerSource"));  // GetService 消耗 matching 引用,不用 release
+    if (svc) {
+        CFMutableDictionaryRef props = NULL;
+        if (CreateProps(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+            int cur = dh_batt_int_prop(props, CFSTR("CurrentCapacity"));
+            int max = dh_batt_int_prop(props, CFSTR("MaxCapacity"));
+            if (max > 0 && cur >= 0) pct = cur * 100 / max;
+            int ch = dh_batt_int_prop(props, CFSTR("IsCharging"));
+            if (charging && ch >= 0) *charging = ch;
+            CFRelease(props);
+        }
+        Release(svc);
     }
-    Release(svc);
     return pct;
 }
-// 锁屏状态:读 DHUnlock 写的 /var/jb/tmp/dh_lockstate("1"锁/"0"解);无文件(没装 DHUnlock)返回 -1=未知。
+// 锁屏状态:读 DHUnlock 写的 jbroot 下 dh_lockstate("1"锁/"0"解);无文件(没装 DHUnlock)返回 -1=未知。
 // collector 读不到 SpringBoard 的 SBLockScreenManager,精确锁屏态由 SpringBoard 里的 DHUnlock 落文件转达。
 static int dh_screen_locked(void) {
-    NSString *s = [NSString stringWithContentsOfFile:@"/var/jb/tmp/dh_lockstate" encoding:NSUTF8StringEncoding error:nil];
+    NSString *s = [NSString stringWithContentsOfFile:dhLockstateFile() encoding:NSUTF8StringEncoding error:nil];
     if (!s.length) return -1;
     return [s hasPrefix:@"1"] ? 1 : 0;
 }
 // 是否装了 Frida(dh_frida daemon 二进制需 devkit 构建才有 + frida-server 已装)。web 据此显示/隐藏 Frida 功能。
+// frida-server 随越狱根装(rootless=/var/jb/usr/sbin,rootful=/usr/sbin),同样按 dh_jbroot() 拼。
 static BOOL dh_frida_available(void) {
+    char bin[96], srv[64];
+    dh_jb_path(bin, sizeof bin, "/usr/lib/IOSDecryptHub/IOSDecryptHubFrida");
+    dh_jb_path(srv, sizeof srv, "/usr/sbin/frida-server");
     NSFileManager *fm = [NSFileManager defaultManager];
-    return [fm fileExistsAtPath:@"/var/jb/usr/lib/IOSDecryptHub/IOSDecryptHubFrida"]
-        && [fm fileExistsAtPath:@"/var/jb/usr/sbin/frida-server"];
+    return [fm fileExistsAtPath:@(bin)]
+        && [fm fileExistsAtPath:@(srv)];
 }
 // frida 真就绪:二进制在 + frida-server 27042 可连(重启后 frida-server 晚起,二进制在≠就绪)。
 // 保活自启的 frida spawn 据此判断——没就绪就先别启动、等 frida 起来,避免拿无 frida 方式把 App 占位。
@@ -181,7 +225,9 @@ static NSString *procState(NSString *proc, int *lanPort) {
     return dh_proc_alive([proc UTF8String]) ? @"idle" : @"dead";
 }
 
-#define AGG_PORT 8089
+// 8080:远离引擎本地 bind 范围 8088-8108(src/server/http_server.m)与反代 slot 8200+(collector.c LAN_PORT_BASE),
+// 三者互不抢端口;8080 也是通用替代 HTTP 端口,浏览器里最好记。
+#define AGG_PORT 8080
 #ifndef ENGINE_VER
 #define ENGINE_VER "1.27.5"   // 兜底;正常由 build_deb.sh 的 -DENGINE_VER 从 Makefile VERSION 注入(单一真相源,不再手动同步)
 #endif
@@ -760,9 +806,9 @@ static NSDictionary *controlAppData(void) {
     NSDictionary *ports = appInjectMap();
     NSString *fgKeep = cfgGetScalar(DH_KEY_FGKEEP);   // 当前「保持前台」目标(单值)
     // 前台判定优先用【真 frontmost】:SpringBoard 里的 DHUnlock 把 _accessibilityFrontMostApplication 写
-    // /var/jb/tmp/dh_frontmost(唯一、切换即时准确)。文件 nil=没装 DHUnlock → 退回 suspend_count 猜(对 VPN 类
+    // jbroot 下的 dh_frontmost(唯一、切换即时准确)。文件 nil=没装 DHUnlock → 退回 suspend_count 猜(对 VPN 类
     // 后台常驻 App 长期 suspend=0、切后台宽限期都会误判,且可能同时报多个)。文件为空="桌面/无前台"。
-    NSString *fmRaw = [NSString stringWithContentsOfFile:@"/var/jb/tmp/dh_frontmost" encoding:NSUTF8StringEncoding error:nil];
+    NSString *fmRaw = [NSString stringWithContentsOfFile:dhFrontmostFile() encoding:NSUTF8StringEncoding error:nil];
     BOOL haveFm = (fmRaw != nil);
     NSString *fmBundle = [(fmRaw ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSMutableArray *out = [NSMutableArray array];
@@ -809,7 +855,11 @@ static NSDictionary *controlAppData(void) {
 // 启动 App:daemon 直接调 SpringBoardServices 的 SBSLaunchApplicationWithIdentifier 权限不足(实测失败),
 // 改用越狱工具 uiopen --bundleid(它有正确上下文,实测可拉起 App)。
 static BOOL launchApp(NSString *bundle) {
-    const char *tool = "/var/jb/usr/bin/uiopen";
+    // rootful 兼容:优先按 dh_jbroot() 拼越狱的 uiopen(rootless=/var/jb/usr/bin,rootful=/usr/bin),
+    // 回退链保留(/usr/bin/uiopen 兜底)。
+    char jb[64];
+    dh_jb_path(jb, sizeof jb, "/usr/bin/uiopen");
+    const char *tool = jb;
     if (access(tool, X_OK) != 0) tool = "/usr/bin/uiopen";
     if (access(tool, X_OK) != 0) return NO;
     char *const argv[] = { (char *)tool, "--bundleid", (char *)[bundle UTF8String], NULL };
@@ -838,7 +888,7 @@ static BOOL validBundle(NSString *b) {
     return [[b stringByTrimmingCharactersInSet:ok] length] == 0;
 }
 static NSString *fridaJsPath(NSString *bundle) {
-    return [DH_FRIDA_DIR stringByAppendingPathComponent:[bundle stringByAppendingString:@".js"]];
+    return [dhFridaDir() stringByAppendingPathComponent:[bundle stringByAppendingString:@".js"]];
 }
 // 智能启动(冷启动场景用):配了 Frida JS 且 frida 可用 → 写请求让 dh_frida frida spawn+注入;否则 uiopen。
 // 保持前台的退出自启、restart-app 都用它,保证配了 JS 的 App「启动即带 frida」。仅用于进程不在时(冷启动);
@@ -848,7 +898,7 @@ static BOOL launchAppSmart(NSString *bundle) {
     BOOL hasJs = [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)];
     if (hasJs) {
         if (!dh_frida_ready()) return NO;   // 配了 JS 但 frida 没就绪 → 不用无 frida 方式占位启动,等下轮
-        return [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return [bundle writeToFile:dhFridaReq() atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
     return launchApp(bundle);   // 没配 JS → 普通 uiopen
 }
@@ -904,7 +954,7 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         // 智能:配了 Frida JS 且 frida 可用 → 写请求让 dh_frida spawn+注入(冷启动即注入);否则 uiopen 普通启动。
         BOOL hasJs = [[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)];
         if (hasJs && dh_frida_ready()) {
-            BOOL w = [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            BOOL w = [bundle writeToFile:dhFridaReq() atomically:YES encoding:NSUTF8StringEncoding error:nil];
             sendJSON(fd, @{@"ok": @(w), @"killed": @(killed), @"frida": @YES,
                            @"note": w ? @"已请求 frida 启动并注入 JS(看脚本日志)" : @"写 frida 请求失败"});
             return;
@@ -963,7 +1013,7 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
             && dh_frida_ready()
             && pid != fridaInjectedPid(bundle)) {
             NSString *req = [NSString stringWithFormat:@"attach:%@:%d", bundle, pid];
-            attachReq = [req writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            attachReq = [req writeToFile:dhFridaReq() atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
         dh_undim_screen();
         BOOL ok = launchApp(bundle);
@@ -1088,7 +1138,7 @@ static void handleConn(int fd) {
             NSString *bundle = parseQuery(query)[@"bundle"];
             if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
             NSData *js = readReqBody(fd, buf, got);
-            [[NSFileManager defaultManager] createDirectoryAtPath:DH_FRIDA_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dhFridaDir() withIntermediateDirectories:YES attributes:nil error:nil];
             BOOL w = [js writeToFile:fridaJsPath(bundle) atomically:YES];
             sendJSON(fd, @{@"ok": @(w), @"bytes": @(js.length)}); return;
         }
@@ -1105,7 +1155,7 @@ static void handleConn(int fd) {
             if (![[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]) { sendJSON(fd, @{@"ok": @NO, @"err": @"该 App 未设置 Frida JS"}); return; }
             // 启动注入=frida spawn 冷启该 App,需设备解锁(锁屏 spawn 拉不起真进程);锁屏直接拒。
             if (dh_screen_locked() == 1) { sendJSON(fd, @{@"ok": @NO, @"err": @"设备锁屏,先解锁再启动注入"}); return; }
-            BOOL w = [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            BOOL w = [bundle writeToFile:dhFridaReq() atomically:YES encoding:NSUTF8StringEncoding error:nil];
             sendJSON(fd, @{@"ok": @(w), @"note": @"已请求 dh_frida spawn+注入(需 frida-server + dh_frida daemon)"}); return;
         }
         // Frida 脚本消息(console.log/send):读 dh_frida 落的 /var/log/dh-frida.jsonl 尾部,可按 bundle 过滤。
@@ -1206,7 +1256,7 @@ static NSString *fgExecForBundle(NSString *bundle) {
 }
 // dh_frida 注入成功记录的 pid(该 bundle 上次被注入到哪个进程);无记录/读不到返回 -1。
 static int fridaInjectedPid(NSString *bundle) {
-    NSString *p = [DH_FRIDA_INJ_DIR stringByAppendingPathComponent:bundle];
+    NSString *p = [dhFridaInjDir() stringByAppendingPathComponent:bundle];
     NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
     return s.length ? [s intValue] : -1;
 }
@@ -1242,7 +1292,7 @@ static void *fgKeepThread(void *arg) {
                         if (pid != injPid && pid != lastRestartPid) {
                             aggLog([NSString stringWithFormat:@"[fg-keep] %@ 运行中但未注入 frida(pid %d,注入记录 %d),kill 后 spawn 重注入", bundle, pid, injPid]);
                             killAppByBundle(bundle);
-                            [bundle writeToFile:DH_FRIDA_REQ atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                            [bundle writeToFile:dhFridaReq() atomically:YES encoding:NSUTF8StringEncoding error:nil];
                             lastRestartPid = pid; bgSince = 0; restarted = YES;
                         }
                     }
@@ -1267,7 +1317,7 @@ static void *fgKeepThread(void *arg) {
 }
 
 void dh_agg_http_start(void) {
-    // 同步 bind+listen:返回时 :8089 已可连(不等内存桥等慢活)。collector main 里最先调它,
+    // 同步 bind+listen:返回时 :8080 已可连(不等内存桥等慢活)。collector main 里最先调它,
     // 保证重启后面板端口第一时间就绪——之前放线程里被内存桥(扫严格 daemon+task_for_pid)抢占,晚 ~9s+。
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     if (ls < 0) { aggLog(@"[agg] socket 失败"); return; }

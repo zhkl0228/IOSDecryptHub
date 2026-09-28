@@ -35,9 +35,23 @@
 #define TAG "[DHCompanion]"
 
 // 总闸:该文件在 → companion 立刻退出,什么都不做(白名单模式注入面已很小,这是便宜保险)。
-#define DH_KILLSWITCH   "/var/jb/tmp/dh-companion-off"
-#define DH_ENGINE_PATH  "/var/jb/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
-#define DH_CONFIG_PATH  @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
+// 以下路径均 rootful 兼容:不再硬编码 /var/jb/...,运行时按 dh_jbroot() 拼(rootless 前缀
+// /var/jb,rootful 真实根)。静态缓冲首次填充后缓存。
+static const char *dh_killswitch_path(void) {
+    static char buf[64];
+    if (!buf[0]) dh_jb_path(buf, sizeof buf, "/tmp/dh-companion-off");
+    return buf;
+}
+static const char *dh_engine_path(void) {
+    static char buf[128];
+    if (!buf[0]) dh_jb_path(buf, sizeof buf, "/usr/lib/IOSDecryptHub/decrypt_helper.dylib");
+    return buf;
+}
+static NSString *dh_config_path(void) {
+    char buf[128];
+    dh_jb_path(buf, sizeof buf, "/usr/lib/IOSDecryptHub/config/enabledBundles.plist");
+    return @(buf);
+}
 
 static char g_proc[DH_PROC_MAX];
 
@@ -70,7 +84,7 @@ static int dh_connect(uint8_t type) {
     struct sockaddr_un u;
     memset(&u, 0, sizeof u);
     u.sun_family = AF_UNIX;
-    strncpy(u.sun_path, DH_BRIDGE_SOCK, sizeof(u.sun_path) - 1);
+    strncpy(u.sun_path, dh_bridge_sock(), sizeof(u.sun_path) - 1);
     if (connect(fd, (struct sockaddr *)&u, sizeof u) != 0) { close(fd); return -1; }
     struct dh_bridge_hdr h;
     memset(&h, 0, sizeof h);
@@ -347,8 +361,13 @@ static void dh_swizzle_logstore(void) {
 static void *dh_get_mshook(void) {
     void *ms = dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (!ms) {
-        void *h = dlopen("/var/jb/usr/lib/libsubstrate.dylib", RTLD_LAZY | RTLD_GLOBAL);
-        if (!h) h = dlopen("/var/jb/usr/lib/libellekit.dylib", RTLD_LAZY | RTLD_GLOBAL);
+        // rootful 兼容:按 dh_jbroot() 拼(rootless=/var/jb/usr/lib/...,rootful=/usr/lib/...);
+        // 回退链保留:先 substrate 软链,失败再试 ellekit 本体。
+        char sub[64], elk[64];
+        dh_jb_path(sub, sizeof sub, "/usr/lib/libsubstrate.dylib");
+        dh_jb_path(elk, sizeof elk, "/usr/lib/libellekit.dylib");
+        void *h = dlopen(sub, RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen(elk, RTLD_LAZY | RTLD_GLOBAL);
         if (h) ms = dlsym(h, "MSHookFunction");
     }
     return ms;
@@ -399,7 +418,7 @@ static void dh_img_added(const struct mach_header *mh, intptr_t slide) {
 
 // —— 自检 ——
 
-static bool dh_killswitch(void) { return access(DH_KILLSWITCH, F_OK) == 0; }
+static bool dh_killswitch(void) { return access(dh_killswitch_path(), F_OK) == 0; }
 
 static bool dh_hard_blocked(const char *p) {
 #define BLK(x) if (strcmp(p, x) == 0) return true;
@@ -417,7 +436,7 @@ static bool dh_whitelisted(const char *p) {
 // 是否已在 manager 里开启注入(读 jb 配置的 enabledExecutables;沙盒目标读这份)。
 static bool dh_enabled(const char *p) {
     @autoreleasepool {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:DH_CONFIG_PATH];
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:dh_config_path()];
         NSArray *arr = d[DH_KEY_EXECS];
         if (![arr isKindOfClass:[NSArray class]]) return false;
         return [arr containsObject:[NSString stringWithUTF8String:p]];
@@ -448,7 +467,7 @@ static void *dh_mem_load_thread(void *arg) {
             g_dh_shm.dbg_enabled = 1;
             syslog(LOG_NOTICE, TAG " 收到 collector cmd_load,dlopen 引擎架桥(内存桥)");
             _dyld_register_func_for_add_image(dh_img_added);
-            void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
+            void *h = dlopen(dh_engine_path(), RTLD_NOW);
             g_dh_shm.dbg_dlopen = h ? 1 : 0;
             syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
             // 落盘失败/悬浮窗抑制走引擎 dh_daemon_env()(已 setenv DH_DAEMON=1);此处只补 swizzle
@@ -494,12 +513,12 @@ static void dh_companion_init(void) {
         // 部署、一定认 env,不做旧引擎回退。
         if (dh_enabled(g_proc)) {
             syslog(LOG_NOTICE, TAG " %s 已启用,载引擎(UDS 直连)", g_proc);
-            setenv("DH_DAEMON_UDS_SOCK", DH_BRIDGE_SOCK, 1);
+            setenv("DH_DAEMON_UDS_SOCK", dh_bridge_sock(), 1);
             setenv("DH_DAEMON_UDS_PROC", g_proc, 1);
             // 普通 daemon:落盘失败/悬浮窗抑制走引擎 dh_daemon_env()(DH_DAEMON=1 已设),cap/log 引擎源码级
             // 自 emit(UDS 直连 collector),不本地 bind——companion 无需 hook 或 swizzle,也无需注册
             // dh_img_added(它只为严格 daemon 内存桥装 socket hook + swizzle,对普通 daemon 是 no-op)。
-            void *h = dlopen(DH_ENGINE_PATH, RTLD_NOW);
+            void *h = dlopen(dh_engine_path(), RTLD_NOW);
             syslog(LOG_NOTICE, TAG " dlopen 引擎 %s", h ? "成功" : "失败");
             (void)h;
         }

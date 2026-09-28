@@ -23,10 +23,23 @@ hook 全在引擎里(`src/hooks/`),由引擎 constructor 完成**——上游这
   inline hook + ObjC swizzle** 重定向引擎 socket I/O(普通 daemon connect-out 到 collector;严格 daemon 走内存桥)
   + 引擎日志/health hook。→ **本 fork 允许 inline hook / MSHookFunction / swizzle**。
 - **collector**(`IOSDecryptHubCollector`,root **常驻 launchd daemon**,RunAtLoad+KeepAlive):按进程名反代出
-  LAN 端口(8090+ slot)、内存桥 `task_for_pid`+`vm_read/write`、引擎日志聚合落 `/var/log/dh-<proc>.log`。
+  LAN 端口(8200 起 slot,避开引擎本地 bind 范围 8088-8108)、聚合面板 `:8080`、内存桥
+  `task_for_pid`+`vm_read/write`、引擎日志聚合落 `/var/log/dh-<proc>.log`。
   → **本 fork 允许常驻 daemon / 监听端口**。
 - 白名单单一来源 `src/dh_daemons.h`;详见 plan `~/.claude/plans/iterative-sprouting-flurry.md` 与聚合方案
   `~/.claude/plans/collector-aggregation-history.md`。
+- **jbroot 路径不硬编码**:companion/collector/DHUnlock/bridge socket 等线 B 路径全部经
+  `src/dh_jbroot.h` 运行时探测(`/var/jb/usr/lib/IOSDecryptHub` 存在→rootless;否则
+  `/usr/lib/IOSDecryptHub` 存在→rootful `/`;默认回退 `/var/jb`),同一份二进制 rootless 与
+  rootful 通吃。**rootful 实装**=roothide 布局的 deb(PREFIX=空)把 control 的
+  `Architecture` 改写为 `iphoneos-arm` 即可装(dpkg 架构匹配 rootful)。loader/管理器
+  App/updater 本就走 dladdr 反推或多候选回退,不受影响。
+- **电量 entitlement**:iOS 17 起 `IOPMPowerSource` 电池节点按 user-client-class entitlement
+  隐藏,无 entitlement 进程匹配返回 0(沙盒不拦、假 entitlement 被内核认可——越狱 AMFI 不校验)。
+  collector 签 `com.apple.security.iokit-user-client-class=IOPMPowerSourceClient`
+  (`daemon/collector_entitlements.plist`)后节点可见,读原始精度 `CurrentCapacity/MaxCapacity`。
+  **不做量化回退**(产品决定:要么原始精度,要么显示未知;曾加过 `IOPSCopyPowerSourcesInfo`
+  回退,5% 量化,已按需求移除)。参考 [BatteryInfo](https://github.com/DevelopCubeLab/BatteryInfo)。
 
 ## 通用
 - **引擎**(`decrypt_helper.dylib`):**源码在本仓 `src/`**(core/hooks/server/ui + 内附 fishhook/capstone),

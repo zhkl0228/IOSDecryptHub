@@ -563,7 +563,10 @@ static void *mb_lan_thread(void *arg) {
 
 // collector(root)读 jb config,判断某 daemon 是否在 enabledExecutables 里(严格 daemon 自己读不了)。
 static int mb_is_enabled(const char *nm) {
-    FILE *f = fopen("/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist", "r");
+    // rootful 兼容:config 路径按 dh_jbroot() 拼(rootless=/var/jb/...,rootful=/...);读不到=未启用。
+    char cfg[128];
+    dh_jb_path(cfg, sizeof cfg, "/usr/lib/IOSDecryptHub/config/enabledBundles.plist");
+    FILE *f = fopen(cfg, "r");
     if (!f) return 0;
     char buf[16384]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
     char needle[80]; snprintf(needle, sizeof needle, "<string>%s</string>", nm);
@@ -796,17 +799,17 @@ extern void dh_agg_http_start(void);   // 聚合历史查询 HTTP 服务(collect
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    dh_agg_http_start();   // 最先起:同步 bind :8089(面板端口第一时间就绪,不被内存桥扫描慢活挡在后面)
-    { pthread_t mbt; if (pthread_create(&mbt, NULL, mem_bridge_manager, NULL) == 0) pthread_detach(mbt); }   // 内存桥(慢)挪到 :8089 之后
-    unlink(DH_BRIDGE_SOCK);
+    dh_agg_http_start();   // 最先起:同步 bind :8080(面板端口第一时间就绪,不被内存桥扫描慢活挡在后面)
+    { pthread_t mbt; if (pthread_create(&mbt, NULL, mem_bridge_manager, NULL) == 0) pthread_detach(mbt); }   // 内存桥(慢)挪到 :8080 之后
+    unlink(dh_bridge_sock());
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ls < 0) { logts("[collector] socket 失败 errno=%d", errno); return 1; }
     struct sockaddr_un u; memset(&u, 0, sizeof u); u.sun_family = AF_UNIX;
-    strncpy(u.sun_path, DH_BRIDGE_SOCK, sizeof(u.sun_path) - 1);
-    if (bind(ls, (struct sockaddr *)&u, sizeof u) != 0) { logts("[collector] bind %s 失败 errno=%d", DH_BRIDGE_SOCK, errno); return 1; }
-    chmod(DH_BRIDGE_SOCK, 0777);   // 让沙盒里的 companion 能 connect
+    strncpy(u.sun_path, dh_bridge_sock(), sizeof(u.sun_path) - 1);
+    if (bind(ls, (struct sockaddr *)&u, sizeof u) != 0) { logts("[collector] bind %s 失败 errno=%d", dh_bridge_sock(), errno); return 1; }
+    chmod(dh_bridge_sock(), 0777);   // 让沙盒里的 companion 能 connect
     listen(ls, 64);
-    logts("[collector] 启动,监听 %s", DH_BRIDGE_SOCK);
+    logts("[collector] 启动,监听 %s", dh_bridge_sock());
     accept_thread((void *)(long)ls);   // 主线程即 accept 循环
     return 0;
 }

@@ -2,9 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- 内存桥反读/反写严格 daemon 内存需要 task port（越狱 AMFI 不校验来源，fake 也认） -->
+    <!-- 内存桥反读/反写严格 daemon 内存需要 task port(越狱 AMFI 不校验来源,fake 也认) -->
     <key>com.apple.system-task-ports</key><true/>
     <key>task_for_pid-allow</key><true/>
     <key>platform-application</key><true/>
+    <!-- iOS 17 起 IOPMPowerSource 电池节点按 user-client-class entitlement 对无权限进程隐藏
+         (实测 rootful iPad7,2/17.7.10:无 entitlement 匹配返回 0,声明立即可见,读到原始精度
+         CurrentCapacity/MaxCapacity,不再被 IOPSCopyPowerSourcesInfo 量化到 5%) -->
+    <key>com.apple.security.iokit-user-client-class</key>
+    <array><string>IOPMPowerSourceClient</string></array>
 </dict>
 </plist>

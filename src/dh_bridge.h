@@ -13,9 +13,16 @@
 #define DH_BRIDGE_H
 
 #include <stdint.h>
+#include "dh_jbroot.h"   // rootful 兼容:运行时 jbroot 探测(rootless=/var/jb / rootful=真实根)
 
-// collector 监听的 UNIX socket(root 建;sandbox 内 daemon 可 connect,M0 实测 AF_UNIX 出站放行)
-#define DH_BRIDGE_SOCK   "/var/jb/tmp/dh-bridge.sock"
+// collector 监听的 UNIX socket(root 建;sandbox 内 daemon 可 connect,M0 实测 AF_UNIX 出站放行)。
+// rootful 兼容:不再硬编码 /var/jb/tmp/...,首次调用按 dh_jbroot() 拼(rootless=/var/jb/tmp/...,
+// rootful=/tmp/...)后缓存。同一 static 缓冲:逐调用取用即可,勿同时传给两个会别住的调用。
+static inline const char *dh_bridge_sock(void) {
+    static char buf[108];
+    if (!buf[0]) dh_jb_path(buf, sizeof buf, "/tmp/dh-bridge.sock");
+    return buf;
+}
 #define DH_BRIDGE_MAGIC  0x44484331u   // 'DHC1'
 
 enum {

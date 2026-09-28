@@ -34,12 +34,28 @@
 #import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <syslog.h>
+#import "dh_jbroot.h"   // rootful 兼容:运行时 jbroot 探测(本文件在 src/ 下,同目录引用)
 
 #define UNLOCK_TAG        "[DHUnlock]"
-#define DH_CFG_PATH       @"/var/jb/usr/lib/IOSDecryptHub/config/enabledBundles.plist"
 #define DH_KEY_FGKEEP     @"foregroundKeep"
-#define DH_LOCKSTATE_FILE @"/var/jb/tmp/dh_lockstate"   // 写 isUILocked("1"锁/"0"解),供 collector 读给 web 显示
-#define DH_FRONTMOST_FILE @"/var/jb/tmp/dh_frontmost"   // 写真 frontmost App 的 bundle id(空=桌面/无),供 collector 读
+
+// 以下路径均 rootful 兼容:不再硬编码 /var/jb/...,运行时按 dh_jbroot() 拼(rootless 前缀
+// /var/jb,rootful 真实根);与 companion / collector 的拼法同源(dh_jbroot.h 单一真相源)。
+static NSString *dh_cfg_path(void) {
+    char buf[128];
+    dh_jb_path(buf, sizeof buf, "/usr/lib/IOSDecryptHub/config/enabledBundles.plist");
+    return @(buf);
+}
+static NSString *dh_lockstate_file(void) {
+    char buf[64];
+    dh_jb_path(buf, sizeof buf, "/tmp/dh_lockstate");
+    return @(buf);
+}
+static NSString *dh_frontmost_file(void) {
+    char buf[64];
+    dh_jb_path(buf, sizeof buf, "/tmp/dh_frontmost");
+    return @(buf);
+}
 
 static dispatch_source_t g_fg_timer;   // 前台 App 查询定时器(主队列)
 
@@ -49,7 +65,7 @@ static inline id dh_msg0(id obj, const char *sel) {
 
 // 是否设了「保持前台」目标(foregroundKeep 非空)。读不到一律当未设——默认沉默,绝不擅自解锁。
 static BOOL dh_fgkeep_set(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:DH_CFG_PATH];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:dh_cfg_path()];
     id v = d[DH_KEY_FGKEEP];
     return [v isKindOfClass:[NSString class]] && [v length] > 0;
 }
@@ -63,7 +79,7 @@ static void dh_write_lockstate_async(void) {
             id mgr = dh_msg0((id)cls, "sharedInstance");
             if (mgr) locked = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, sel_getUid("isUILocked"));
         }
-        [(locked ? @"1" : @"0") writeToFile:DH_LOCKSTATE_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [(locked ? @"1" : @"0") writeToFile:dh_lockstate_file() atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
 }
 
@@ -87,7 +103,7 @@ static void dh_write_frontmost(void) {
             if ([b isKindOfClass:[NSString class]]) bid = b;
         }
     }
-    [bid writeToFile:DH_FRONTMOST_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [bid writeToFile:dh_frontmost_file() atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 // 【主队列】模拟按 HOME 键去桌面。用 SpringBoard(app 即 UIApplication 子类)的
