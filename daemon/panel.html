@@ -32,12 +32,12 @@ a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
 .txt{padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#0b0d12;color:var(--fg);width:300px;max-width:60vw}
 .row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#1b2230;border:1px solid var(--line);padding:10px 18px;border-radius:10px;opacity:0;transition:.2s;pointer-events:none;max-width:80vw}
-#fovl{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
+#fovl,#dovl{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
 .fbox{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;width:min(92vw,720px);max-height:86vh;display:flex;flex-direction:column}
 .fhdr{font-weight:600;margin-bottom:10px}
 #fjs{width:100%;height:52vh;box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px;font:13px/1.5 ui-monospace,Menlo,monospace}
 .frow{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#flog{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.45 ui-monospace,Menlo,monospace;height:20vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
+#flog,#dlog{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;font:12px/1.45 ui-monospace,Menlo,monospace;height:20vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
 #toast.show{opacity:1}
 .err{color:#e6788a}
 </style></head><body>
@@ -180,7 +180,9 @@ function renderA(){
       // 切前台/重启/启动都靠 uiopen,锁屏时上不来,故仅解锁(_locked===0)时显示;Frida(编辑脚本)不受锁屏影响,保留。
       +      ((x.running && _locked===0 && !x.foreground) ? '<button class="btn" onclick="toFg(\''+esc(x.bundle)+'\')" title="uiopen 切到前台(仅解锁时)">切前台</button> ' : '')
       +      (_locked!==1 ? '<button class="btn'+((x.fridaJS&&_fridaAvail)?' inj':'')+'" onclick="rstA(\''+esc(x.bundle)+'\')" title="'+((x.fridaJS&&_fridaAvail)?'重启并注入 Frida JS':'普通重启(uiopen)')+'">'+(x.running?'重启':'启动')+'</button> ' : '')
-      +      (_fridaAvail?'<button class="btn" onclick="fridaEdit(\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')">Frida'+(x.fridaJS?' ●':'')+'</button>':'')+'</td></tr>';
+      +      (_fridaAvail?'<button class="btn" onclick="fridaEdit(\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')">Frida'+(x.fridaJS?' ●':'')+'</button>':'')
+      // 脱壳(ipadecrypt-helper):目标 App 无需注入引擎,任何已安装 App 都可脱,不受锁屏/注入状态限制。
+      +      ' <button class="btn" onclick="dumpOpen(\''+esc(x.bundle)+'\',\''+esc(x.name)+'\')" title="ipadecrypt-helper 脱壳(无需注入引擎)">脱壳</button></td></tr>';
   });
   if(!list.length) h += '<tr><td class="muted" colspan="7">无匹配</td></tr>';
   h += '</table>';
@@ -223,6 +225,86 @@ async function goHome(){
   var r = await post("/api/control/home");
   toast(r.ok ? "已回桌面" : ("失败:"+(r.err||"")), !r.ok);
   setTimeout(loadA, 1200);   // 刷新前台状态
+}
+
+/* ---- 脱壳(ipadecrypt-helper;目标 App 无需注入引擎)---- */
+function dumpClose(){ var o=document.getElementById("dovl"); if(o)o.style.display="none"; if(window._dTimer){clearInterval(window._dTimer);window._dTimer=null;} }
+async function dumpOpen(b,name){
+  var ov=document.getElementById("dovl");
+  if(!ov){ ov=document.createElement("div"); ov.id="dovl"; ov.onclick=function(ev){ if(ev.target===ov) dumpClose(); }; document.body.appendChild(ov); }
+  ov.innerHTML='<div class="fbox"><div class="fhdr">脱壳 — '+esc(name)+' <span class="muted">'+esc(b)+'</span></div>'
+    +'<div class="muted" style="font-size:12px">ipadecrypt-helper:spawn 挂起目标 → 读内存已解密页 → 重建 IPA(目标 App 无需注入引擎)。</div>'
+    +'<div class="frow"><button class="btn" id="dstartbtn" onclick="dumpStart(\''+esc(b)+'\')">开始脱壳</button>'
+    +'<a class="btn" id="ddl" style="display:none" href="/api/dump/download?bundle='+encodeURIComponent(b)+'">下载 IPA</a>'
+    +'<button class="btn" onclick="dumpClose()">关闭</button><span class="muted" id="dstat"></span></div>'
+    +'<pre id="dlog"></pre></div>';
+  ov.style.display="flex";
+  bindSelectAll(document.getElementById("dlog"));   // 聚焦后 Ctrl+A 只全选日志(不选中整个网页)
+  dumpPoll(b);
+  if(window._dTimer) clearInterval(window._dTimer);
+  window._dTimer=setInterval(function(){ dumpPoll(b); }, 1500);
+}
+async function dumpStart(b){
+  var st=document.getElementById("dstat"); if(st) st.textContent="启动中…";
+  var r = await post("/api/dump/start?bundle="+encodeURIComponent(b));
+  if(!r.ok && st) st.textContent="失败:"+(r.err||"");
+  dumpPoll(b);
+}
+// @evt 行(自定义 k=v)取值:支持 key="带引号" 与 key=裸值。
+function dumpKv(ln,key){
+  var m = ln.match(new RegExp('(?:^| )'+key+'="((?:\\\\.|[^"])*)"'));
+  if(m) return m[1].replace(/\\(.)/g,'$1');
+  m = ln.match(new RegExp('(?:^| )'+key+'=([^ ]*)'));
+  return m ? m[1] : '';
+}
+// 长路径缩短(容器 UUID 路径 → …/),事件行与状态行共用。
+function pathShort(t){
+  return (t||'').replace(/\/var\/containers\/Bundle\/Application\/[0-9A-Fa-f-]+\//g,'…/').replace(/\/var\/tmp\/dh-dump\//g,'');
+}
+// 事件流格式化:原始 @evt 行太啰嗦(路径超长),提炼为 图标+msg;长容器路径缩成 …/。
+function fmtDumpLine(ln){
+  var evt=dumpKv(ln,'event'), lvl=dumpKv(ln,'level'), msg=dumpKv(ln,'msg');
+  var text = pathShort(msg || ln);
+  var icon = '· ';
+  if(lvl==='error') icon='❌ ';
+  else if(evt==='done') icon='✅ ';
+  else if(evt==='pack.done') icon='📦 ';
+  else if(evt==='image.done') icon='✓ ';
+  else if(evt==='bundle.begin') icon='▸ ';
+  else if(evt==='bundle.done') icon='✓ ';
+  else if(evt==='target.spawned') icon='⏵ ';
+  return icon + text;
+}
+// pre 聚焦后 Ctrl/Cmd+A 只全选 pre 内容(否则浏览器默认选中整个网页)。
+function bindSelectAll(pre){
+  if(!pre || pre._sa) return; pre._sa=1;
+  pre.tabIndex = 0;
+  pre.addEventListener('keydown', function(ev){
+    if((ev.ctrlKey||ev.metaKey) && (ev.key==='a'||ev.key==='A')){
+      ev.preventDefault();
+      var sel=window.getSelection(), r=document.createRange();
+      r.selectNodeContents(pre); sel.removeAllRanges(); sel.addRange(r);
+    }
+  });
+}
+async function dumpPoll(b){
+  try{
+    var j = await (await fetch("/api/dump/status?bundle="+encodeURIComponent(b))).json();
+    var st=document.getElementById("dstat"), lg=document.getElementById("dlog"), dl=document.getElementById("ddl"), sb=document.getElementById("dstartbtn");
+    if(!st) return;
+    var label = j.state==="running"?"脱壳中…":(j.state==="done"?"✅ 完成":(j.state==="error"?"❌ 失败":"未开始"));
+    st.textContent = label + (j.stage?(" · "+pathShort(j.stage)):"")
+      + (j.ver?(" · v"+j.ver):"")
+      + (j.state==="done"&&j.size?(" · "+(j.size/1048576).toFixed(1)+" MB"):"")
+      + (j.state==="error"&&j.err?(" · "+j.err):"");
+    if(lg && j.log){
+      var atBottom=(lg.scrollHeight - lg.scrollTop - lg.clientHeight) < 30;   // 刷新前是否贴底
+      lg.textContent = j.log.map(fmtDumpLine).join('\n');
+      if(atBottom) lg.scrollTop = lg.scrollHeight;   // 只在原本贴底时跟随最新;上拉看旧日志保持位置(同 frida)
+    }
+    if(dl) dl.style.display = (j.state==="done") ? "" : "none";
+    if(sb) sb.style.display = (j.state==="running") ? "none" : "";
+  }catch(e){}
 }
 
 function fridaClose(){ var o=document.getElementById("fovl"); if(o)o.style.display="none"; if(window._flogTimer){clearInterval(window._flogTimer);window._flogTimer=null;} }
@@ -285,6 +367,7 @@ async function fridaEdit(b,name){
     +'<div class="fhdr" style="margin-top:10px">脚本日志 <span class="muted">console.log / send(每 1.5s 刷新)</span> <button class="btn" style="float:right" onclick="fridaClearLog(\''+esc(b)+'\')">清空日志</button></div><pre id="flog"></pre></div>';
   ov.style.display="flex";
   document.getElementById("fjs").value=js;
+  bindSelectAll(document.getElementById("flog"));   // 聚焦后 Ctrl+A 只全选日志(不选中整个网页)
   fridaLogPoll(b);
   if(window._flogTimer) clearInterval(window._flogTimer);
   window._flogTimer=setInterval(function(){ fridaLogPoll(b); }, 1500);

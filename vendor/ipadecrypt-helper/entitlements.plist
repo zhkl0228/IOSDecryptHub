@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- task_for_pid on the target -->
+    <key>task_for_pid-allow</key>
+    <true/>
+
+    <!-- cross-task thread_set_state -->
+    <key>com.apple.private.cs.debugger</key>
+    <true/>
+
+    <!-- platform/sandbox/container slack. platform-application is required:
+         without it AMFI silently terminates the helper before it can spawn
+         the target. The two no-* keys remove container scoping so root can
+         read installed bundles + write to /tmp. -->
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+
+    <!-- SBSLaunchApplicationWithIdentifier -->
+    <key>com.apple.springboard.launchapplications</key>
+    <true/>
+</dict>
+</plist>

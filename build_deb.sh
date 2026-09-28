@@ -346,6 +346,9 @@ CTRL
     # Frida 编排 daemon + JS 目录(可选组件:有 devkit 才装二进制;JS 目录总是建,供 collector 写 <bundle>.js)
     mkdir -p "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/frida"
     [ "$HAVE_FRIDA" = 1 ] && cp "$FRIDA_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$FRIDA_BIN"
+    # ipadecrypt-helper(vendor,MIT):web 脱壳功能的设备端执行体,collector 以
+    # `decrypt <bundle-id> <.app路径> <out.ipa>` 调用;目标 App 无需注入引擎。
+    cp "$SCRIPT_DIR/vendor/ipadecrypt-helper/ipadecrypt-helper" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/ipadecrypt-helper"
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \
@@ -591,6 +594,7 @@ POSTRM
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$DHUNLOCK_DYLIB"
     ldid -S"$SCRIPT_DIR/daemon/collector_entitlements.plist" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
     [ "$HAVE_FRIDA" = 1 ] && ldid -S"$FRIDA_ENT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$FRIDA_BIN"
+    ldid -S"$SCRIPT_DIR/vendor/ipadecrypt-helper/entitlements.plist" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/ipadecrypt-helper"
 
     cp -R "$STAGE/." "$PKG_STAGE/"
     find "$PKG_STAGE" -type d -exec chmod 0755 {} +
@@ -607,6 +611,7 @@ POSTRM
     chmod 0755 "$PKG_STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$COLLECTOR_BIN"
     [ "$HAVE_FRIDA" = 1 ] && chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$FRIDA_BIN"
+    chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/ipadecrypt-helper"
 
     if ! dpkg-deb --build --root-owner-group "$PKG_STAGE" "$DEB_OUT" 2>"$BUILD_DIR/_dpkg-$VARIANT.log"; then
         rm -rf "$PKG_STAGE"

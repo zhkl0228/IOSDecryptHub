@@ -543,9 +543,10 @@ static NSDictionary *statsFor(NSString *proc, NSArray<NSDictionary *> *entries) 
 }
 
 // ———— HTTP I/O ————
-static void writeAll(int fd, const void *buf, size_t n) {
+static int writeAll(int fd, const void *buf, size_t n) {   // 0=写完,-1=写断(客户端断开);调用方可忽略返回值
     const char *p = buf; size_t off = 0;
-    while (off < n) { ssize_t w = write(fd, p + off, n - off); if (w <= 0) break; off += (size_t)w; }
+    while (off < n) { ssize_t w = write(fd, p + off, n - off); if (w <= 0) return -1; off += (size_t)w; }
+    return 0;
 }
 static void httpSend(int fd, int code, const char *status, const char *ctype, NSData *body) {
     NSString *hdr = [NSString stringWithFormat:
@@ -890,6 +891,147 @@ static BOOL validBundle(NSString *b) {
 static NSString *fridaJsPath(NSString *bundle) {
     return [dhFridaDir() stringByAppendingPathComponent:[bundle stringByAppendingString:@".js"]];
 }
+
+// ———— Web 脱壳(ipadecrypt-helper,vendor MIT;目标 App 无需注入引擎)————
+// collector(root)posix_spawn helper `decrypt <bundle> <.app> <out.ipa>`,读其 stdout 的 @evt 事件流
+// 更新进度,完成后产物经 /api/dump/download 流给浏览器。helper dump 时自校验 vm_read 明文 vs 磁盘
+// 密文(image.done source=vm_read 即通过),产物可信。
+#define DH_DUMP_DIR @"/var/tmp/dh-dump"
+
+static NSMutableDictionary *g_dumpTasks;   // bundle -> {state,stage,log[NSString],ipa,size,err}
+static NSLock *g_dumpLock;
+static void dumpTasksEnsure(void) {
+    static dispatch_once_t o;
+    dispatch_once(&o, ^{ g_dumpTasks = [NSMutableDictionary dictionary]; g_dumpLock = [NSLock new]; });
+}
+static NSString *dumpHelperPath(void) {
+    char buf[256]; dh_jb_path(buf, sizeof buf, "/usr/lib/IOSDecryptHub/ipadecrypt-helper");
+    return @(buf);
+}
+// 按 bundle id 找已安装 .app 路径(系统 /Applications + jb /Applications + 用户容器)。
+static NSString *dumpFindAppPath(NSString *bundle) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *dirs = [NSMutableArray arrayWithObject:@"/Applications"];
+    char jb[128]; dh_jb_path(jb, sizeof jb, "/Applications");
+    [dirs addObject:@(jb)];
+    for (NSString *c in [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil])
+        [dirs addObject:[@"/var/containers/Bundle/Application" stringByAppendingPathComponent:c]];
+    for (NSString *dir in dirs) {
+        for (NSString *e in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if (![[e.pathExtension lowercaseString] isEqualToString:@"app"]) continue;
+            NSString *ap = [dir stringByAppendingPathComponent:e];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[ap stringByAppendingPathComponent:@"Info.plist"]];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:bundle]) return ap;
+        }
+    }
+    return nil;
+}
+// @evt 行(自定义 k=v,非 JSON)里取某个 key 的值:支持 key=裸值 与 key="带引号(可含空格/转义)"。
+static NSString *dumpKvVal(NSString *ln, NSString *key) {
+    NSString *pat = [key stringByAppendingString:@"="];
+    NSRange r = [ln rangeOfString:[@" " stringByAppendingString:pat]];
+    NSUInteger vstart;
+    if (r.location != NSNotFound) vstart = r.location + r.length;
+    else if ([ln hasPrefix:pat]) vstart = pat.length;
+    else return nil;
+    if (vstart >= ln.length) return @"";
+    if ([ln characterAtIndex:vstart] == '"') {
+        NSMutableString *out = [NSMutableString string];
+        NSUInteger i = vstart + 1;
+        while (i < ln.length) {
+            unichar ch = [ln characterAtIndex:i];
+            if (ch == '\\' && i + 1 < ln.length) { [out appendFormat:@"%C", [ln characterAtIndex:i + 1]]; i += 2; continue; }
+            if (ch == '"') break;
+            [out appendFormat:@"%C", ch]; i++;
+        }
+        return out;
+    }
+    NSRange sp = [ln rangeOfString:@" " options:0 range:NSMakeRange(vstart, ln.length - vstart)];
+    return [ln substringWithRange:NSMakeRange(vstart, sp.location == NSNotFound ? ln.length - vstart : sp.location - vstart)];
+}
+// 起一次脱壳:spawn helper + 读事件流。该 bundle 已在跑则拒。errOut 回填失败原因。
+static BOOL dumpStart(NSString *bundle, NSString **errOut) {
+    dumpTasksEnsure();
+    [g_dumpLock lock];
+    NSDictionary *t = g_dumpTasks[bundle];
+    if ([t[@"state"] isEqualToString:@"running"]) {
+        [g_dumpLock unlock];
+        if (errOut) *errOut = @"该 App 正在脱壳中";
+        return NO;
+    }
+    [g_dumpLock unlock];
+    NSString *appPath = dumpFindAppPath(bundle);
+    if (!appPath) { if (errOut) *errOut = @"找不到该 App 的安装路径"; return NO; }
+    // 版本号(CFBundleShortVersionString,回退 CFBundleVersion;照 ipadecrypt 的 <bundle>_<ver>.decrypted.ipa 命名)。
+    NSDictionary *appInfo = [NSDictionary dictionaryWithContentsOfFile:[appPath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *ver = appInfo[@"CFBundleShortVersionString"];
+    if (![ver isKindOfClass:[NSString class]] || !ver.length) ver = appInfo[@"CFBundleVersion"];
+    if (![ver isKindOfClass:[NSString class]]) ver = @"";
+    NSString *helper = dumpHelperPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:helper]) { if (errOut) *errOut = @"ipadecrypt-helper 未安装"; return NO; }
+    [[NSFileManager defaultManager] createDirectoryAtPath:DH_DUMP_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *outIpa = [DH_DUMP_DIR stringByAppendingPathComponent:[bundle stringByAppendingString:@".ipa"]];
+    [[NSFileManager defaultManager] removeItemAtPath:outIpa error:nil];
+    int pfd[2];
+    if (pipe(pfd) != 0) { if (errOut) *errOut = @"pipe 失败"; return NO; }
+    int rfd = pfd[0], wfd = pfd[1];   // block 不能捕获 C 数组,用标量
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, wfd, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, wfd, STDERR_FILENO);   // stderr 并入:catastrophic 也进事件流可见
+    posix_spawn_file_actions_addclose(&fa, rfd);
+    pid_t pid = -1;
+    char *argv[] = { (char *)helper.fileSystemRepresentation, (char *)"decrypt",
+                     (char *)bundle.fileSystemRepresentation, (char *)appPath.fileSystemRepresentation,
+                     (char *)outIpa.fileSystemRepresentation, NULL };
+    int rc = posix_spawn(&pid, helper.fileSystemRepresentation, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(wfd);
+    if (rc != 0 || pid <= 0) {
+        close(rfd);
+        if (errOut) *errOut = [NSString stringWithFormat:@"spawn helper 失败 rc=%d", rc];
+        return NO;
+    }
+    NSMutableDictionary *task = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"state": @"running", @"stage": @"已启动", @"log": [NSMutableArray array],
+        @"ipa": outIpa, @"size": @0, @"err": @"", @"ver": ver }];
+    [g_dumpLock lock]; g_dumpTasks[bundle] = task; [g_dumpLock unlock];
+    // reader+waiter 一体:读 stdout 到 EOF → waitpid → 定终态。
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        FILE *fp = fdopen(rfd, "r");
+        char line[2048];
+        BOOL sawDone = NO; NSString *lastErr = nil;
+        while (fp && fgets(line, sizeof line, fp)) {
+            @autoreleasepool {
+                NSString *ln = [[NSString stringWithUTF8String:line]
+                    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (!ln.length) continue;
+                NSString *evt = dumpKvVal(ln, @"event"), *lvl = dumpKvVal(ln, @"level"), *msg = dumpKvVal(ln, @"msg");
+                [g_dumpLock lock];
+                NSMutableArray *log = task[@"log"];
+                [log addObject:ln];
+                if (log.count > 60) [log removeObjectAtIndex:0];
+                if (msg.length) task[@"stage"] = msg;
+                if ([evt isEqualToString:@"done"]) sawDone = YES;
+                if ([lvl isEqualToString:@"error"]) lastErr = msg.length ? msg : ln;
+                [g_dumpLock unlock];
+            }
+        }
+        if (fp) fclose(fp);
+        int st = 0; waitpid(pid, &st, 0);
+        unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:outIpa error:nil][NSFileSize] unsignedLongLongValue];
+        [g_dumpLock lock];
+        task[@"size"] = @(sz);
+        if (sawDone && sz > 0) { task[@"state"] = @"done"; task[@"stage"] = @"完成"; }
+        else {
+            task[@"state"] = @"error";
+            task[@"err"] = lastErr.length ? lastErr :
+                [NSString stringWithFormat:@"helper 退出(exit=%d)未产出 IPA", WIFEXITED(st) ? WEXITSTATUS(st) : -1];
+        }
+        [g_dumpLock unlock];
+    });
+    return YES;
+}
 // 智能启动(冷启动场景用):配了 Frida JS 且 frida 可用 → 写请求让 dh_frida frida spawn+注入;否则 uiopen。
 // 保持前台的退出自启、restart-app 都用它,保证配了 JS 的 App「启动即带 frida」。仅用于进程不在时(冷启动);
 // App 在运行时(后台拉回)不能用——frida spawn 是冷启动会冲突,那种情况用 launchApp(uiopen)激活。
@@ -1131,6 +1273,59 @@ static void handleConn(int fd) {
         if ([path hasPrefix:@"/api/control/"]) {
             if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"控制操作用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
             handleControl(fd, [path substringFromIndex:13], parseQuery(query)); return;   // "/api/control/"=13
+        }
+        // Web 脱壳(ipadecrypt-helper;目标 App 无需注入引擎):start(POST)/ status(GET)/ download(GET,流式)
+        if ([path isEqualToString:@"/api/dump/start"]) {
+            if (!isPost) { httpSend(fd, 405, "Method Not Allowed", "text/plain", [@"用 POST" dataUsingEncoding:NSUTF8StringEncoding]); return; }
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+            NSString *err = nil;
+            BOOL ok = dumpStart(bundle, &err);
+            sendJSON(fd, @{@"ok": @(ok), @"err": err ?: @""}); return;
+        }
+        if ([path isEqualToString:@"/api/dump/status"]) {
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+            dumpTasksEnsure();
+            [g_dumpLock lock];
+            NSDictionary *t = g_dumpTasks[bundle];
+            NSDictionary *out = t ? @{ @"state": t[@"state"], @"stage": t[@"stage"],
+                                       @"log": [t[@"log"] copy], @"size": t[@"size"], @"err": t[@"err"],
+                                       @"ver": t[@"ver"] ?: @"" }
+                                  : @{ @"state": @"idle", @"stage": @"", @"log": @[], @"size": @0, @"err": @"", @"ver": @"" };
+            [g_dumpLock unlock];
+            sendJSON(fd, out); return;
+        }
+        if ([path isEqualToString:@"/api/dump/download"]) {
+            NSString *bundle = parseQuery(query)[@"bundle"];
+            if (!validBundle(bundle)) { sendJSON(fd, @{@"ok": @NO, @"err": @"非法 bundle"}); return; }
+            dumpTasksEnsure();
+            [g_dumpLock lock];
+            NSDictionary *t = g_dumpTasks[bundle];
+            NSString *state = t[@"state"], *ipa = t[@"ipa"], *ver = t[@"ver"];
+            [g_dumpLock unlock];
+            if (![state isEqualToString:@"done"] || !ipa.length) { sendJSON(fd, @{@"ok": @NO, @"err": @"脱壳未完成"}); return; }
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:ipa];
+            if (!fh) { sendJSON(fd, @{@"ok": @NO, @"err": @"产物文件不存在(可能已被清理)"}); return; }
+            unsigned long long sz = [fh seekToEndOfFile]; [fh seekToFileOffset:0];
+            // 文件名照 ipadecrypt:<bundle>_<version>.decrypted.ipa(无版本则省略);版本号过滤到安全字符。
+            NSString *v = [ver isKindOfClass:[NSString class]] ? ver : @"";
+            v = [[v componentsSeparatedByCharactersInSet:[[NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"] invertedSet]] componentsJoinedByString:@"_"];
+            NSString *fname = v.length ? [NSString stringWithFormat:@"%@_%@.decrypted.ipa", bundle, v]
+                                       : [NSString stringWithFormat:@"%@.decrypted.ipa", bundle];
+            NSString *hdr = [NSString stringWithFormat:
+                @"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %llu\r\n"
+                "Content-Disposition: attachment; filename=\"%@\"\r\nConnection: close\r\n\r\n", sz, fname];
+            writeAll(fd, (void *)hdr.UTF8String, hdr.length);
+            while (1) {   // 1MB 分块流式(几百 MB IPA 不进内存)
+                @autoreleasepool {
+                    NSData *chunk = [fh readDataOfLength:(1u << 20)];
+                    if (chunk.length == 0) break;
+                    if (writeAll(fd, (void *)chunk.bytes, chunk.length) != 0) break;   // 客户端断开即停
+                }
+            }
+            [fh closeFile];
+            return;
         }
         // Frida:保存 JS(POST body=脚本)/ 读 JS(GET)/ 启动注入(POST 写请求文件,dh_frida daemon 执行)
         if ([path isEqualToString:@"/api/frida/save"]) {
