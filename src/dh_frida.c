@@ -10,10 +10,11 @@
 // 为什么 resume 后才 attach:实测本环境对 spawn 挂起态进程直接 attach 报 "connection is closed"
 //   (goog-trans 也因此 resume 后 attach);故 spawn→resume→短延迟→attach→load(App 刚起来即注入)。
 //
-// 触发:collector 把请求(目标 bundle id)写进 REQ_FILE,本 daemon g_timeout 轮询处理;JS 从
-//   JS_DIR/<bundle>.js 读。collector 只管 web + 存 JS + 写请求,frida 交互全在这。
+// 触发:collector 把请求(目标 bundle id)写进 dh_frida_req(),本 daemon g_timeout 轮询处理;JS 从
+//   dh_frida_js_dir()/<bundle>.js 读。collector 只管 web + 存 JS + 写请求,frida 交互全在这。
 
 #include "frida-core.h"
+#include "dh_jbroot.h"   // rootful 兼容:运行时 jbroot 探测(与 collector_http.m 的 dhFrida* 同源)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,10 +24,13 @@
 #include <sys/stat.h>   // mkdir(记录注入 pid 目录)
 
 #define FRIDA_TAG   "[dh-frida]"
-#define REQ_FILE    "/var/jb/tmp/dh-frida-req"        // collector 写:一行 bundle id
-#define JS_DIR      "/var/jb/usr/lib/IOSDecryptHub/frida"  // <bundle>.js
 #define MSG_LOG     "/var/log/dh-frida.jsonl"              // script console.log/send 落这,collector 读给 web 显示
-#define INJ_DIR     "/var/jb/tmp/dh-frida-inj"             // 注入成功后写 <bundle>=pid,供 collector 判"当前实例是否已注入"
+// rootful 兼容:同 collector_http.m 的 dhFrida* 语义,经 dh_jbroot() 运行时拼(rootless 前缀
+// /var/jb,rootful 真实根)——collector 写请求/JS 与本 daemon 读的路径必须同源,否则 rootful 上
+// 双方落到不同目录、daemon 永远收不到请求。静态缓冲首次填充后缓存。
+static const char *dh_frida_req(void)     { static char b[64]; if (!b[0]) dh_jb_path(b, sizeof b, "/tmp/dh-frida-req"); return b; }
+static const char *dh_frida_js_dir(void)  { static char b[96]; if (!b[0]) dh_jb_path(b, sizeof b, "/usr/lib/IOSDecryptHub/frida"); return b; }
+static const char *dh_frida_inj_dir(void) { static char b[64]; if (!b[0]) dh_jb_path(b, sizeof b, "/tmp/dh-frida-inj"); return b; }
 #define RESUME_DELAY_US 800000                         // spawn→resume 后等 App 起来再 attach
 
 static GMainLoop *loop;
@@ -101,8 +105,8 @@ static void inject_pid(const gchar *bundle, guint pid, const gchar *js) {
     syslog(LOG_NOTICE, FRIDA_TAG " %s pid=%u 注入成功(script 保持)", bundle, pid);
     // 记下"该 bundle 已注入到 pid":collector 据此判断当前运行实例是否已注入(不符则未注入)。
     {
-        mkdir(INJ_DIR, 0755);
-        gchar *inj_path = g_strdup_printf("%s/%s", INJ_DIR, bundle);
+        mkdir(dh_frida_inj_dir(), 0755);
+        gchar *inj_path = g_strdup_printf("%s/%s", dh_frida_inj_dir(), bundle);
         FILE *ip = fopen(inj_path, "w");
         if (ip) { fprintf(ip, "%u", pid); fclose(ip); }
         g_free(inj_path);
@@ -114,7 +118,7 @@ done:
 // 主动 spawn 目标 App + 注入其 JS(冷启,启动即注入)。
 static void spawn_inject(const gchar *bundle) {
     GError *e = NULL;
-    gchar *js_path = g_strdup_printf("%s/%s.js", JS_DIR, bundle);
+    gchar *js_path = g_strdup_printf("%s/%s.js", dh_frida_js_dir(), bundle);
     gchar *js = read_file(js_path);
     if (!js) {
         syslog(LOG_ERR, FRIDA_TAG " 无 JS 脚本 %s,跳过 %s", js_path, bundle);
@@ -140,7 +144,7 @@ done:
 // attach 模式:App 已在运行(如「切前台」把它拉上前台),对它 attach 注入——不 kill、不闪、不打断当前 App,
 // 只是错过启动早期(运行中 hooks 生效)。供 collector 的「切前台」对已运行未注入的 App 补注入。
 static void attach_inject(const gchar *bundle, guint pid) {
-    gchar *js_path = g_strdup_printf("%s/%s.js", JS_DIR, bundle);
+    gchar *js_path = g_strdup_printf("%s/%s.js", dh_frida_js_dir(), bundle);
     gchar *js = read_file(js_path);
     if (!js) {
         syslog(LOG_ERR, FRIDA_TAG " 无 JS 脚本 %s,跳过 attach %s", js_path, bundle);
@@ -157,9 +161,9 @@ static void attach_inject(const gchar *bundle, guint pid) {
 //   纯 bundle id        → spawn_inject(冷启+注入)
 //   attach:<bundle>:<pid> → attach_inject(App 已运行,attach 补注入;「切前台」用)
 static gboolean poll_req(gpointer ud) {
-    if (access(REQ_FILE, F_OK) != 0) return TRUE;
-    gchar *content = read_file(REQ_FILE);
-    unlink(REQ_FILE);
+    if (access(dh_frida_req(), F_OK) != 0) return TRUE;
+    gchar *content = read_file(dh_frida_req());
+    unlink(dh_frida_req());
     if (content) {
         gchar *line = g_strstrip(content);
         if (g_str_has_prefix(line, "attach:")) {
@@ -212,9 +216,9 @@ int main(void) {
     frida_unref(devs);
     if (!g_dev) { syslog(LOG_ERR, FRIDA_TAG " 无 REMOTE device(frida-server 没跑?)"); return 2; }
 
-    unlink(REQ_FILE);   // 清残留请求
+    unlink(dh_frida_req());   // 清残留请求
     g_timeout_add(400, poll_req, NULL);
-    syslog(LOG_NOTICE, FRIDA_TAG " 就绪:轮询 %s,JS 目录 %s", REQ_FILE, JS_DIR);
+    syslog(LOG_NOTICE, FRIDA_TAG " 就绪:轮询 %s,JS 目录 %s", dh_frida_req(), dh_frida_js_dir());
     g_main_loop_run(loop);
     return 0;
 }
