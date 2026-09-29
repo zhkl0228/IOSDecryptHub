@@ -713,8 +713,8 @@ static pthread_mutex_t g_proc_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kinfo_proc *g_proc_cache = NULL;
 static int g_proc_cache_cnt = 0;
 static time_t g_proc_cache_t = 0;
-int dh_proc_alive(const char *proc) {
-    pthread_mutex_lock(&g_proc_cache_lock);
+// 进程表缓存刷新(1 秒 TTL),调用方须已持 g_proc_cache_lock。
+static void proc_cache_refresh(void) {
     time_t now = time(NULL);
     if (!g_proc_cache || now != g_proc_cache_t) {   // 1 秒 TTL
         int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 }; size_t len = 0;
@@ -727,11 +727,33 @@ int dh_proc_alive(const char *proc) {
             }
         }
     }
+}
+int dh_proc_alive(const char *proc) {
+    pthread_mutex_lock(&g_proc_cache_lock);
+    proc_cache_refresh();
     int pid = 0;
     for (int i = 0; i < g_proc_cache_cnt; i++)
         if (strncmp(g_proc_cache[i].kp_proc.p_comm, proc, MAXCOMLEN) == 0) { pid = g_proc_cache[i].kp_proc.p_pid; break; }
     pthread_mutex_unlock(&g_proc_cache_lock);
     return pid;
+}
+
+// 进程启动时间(unix 毫秒):复用上面 1s TTL 进程表缓存(kinfo_proc 含 p_starttime),pid 不存在返回 0。
+// 供控制台 web 面板 PID 悬停提示用(collector_http.m controlDaemonList/controlAppData 的 startedAtMs)。
+long long dh_proc_start_ms(int pid) {
+    if (pid <= 0) return 0;
+    pthread_mutex_lock(&g_proc_cache_lock);
+    proc_cache_refresh();
+    long long ms = 0;
+    for (int i = 0; i < g_proc_cache_cnt; i++) {
+        if (g_proc_cache[i].kp_proc.p_pid == pid) {
+            struct timeval tv = g_proc_cache[i].kp_proc.p_starttime;
+            ms = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_proc_cache_lock);
+    return ms;
 }
 
 // 查进程 task 的 suspend_count:>0=被系统挂起(App 转后台后被冻结),0=活跃(前台,或极少数有后台执行权的),

@@ -39,6 +39,7 @@ extern char **environ;
 extern void dh_log(const char *s);                       // collector.c:带时间戳落 collector.log
 extern int  dh_bridge_online(const char *proc, int *lan_port);  // collector.c:引擎是否就绪(可连活引擎)
 extern int  dh_proc_alive(const char *proc);                    // collector.c:进程是否存活(sysctl),0=已退出
+extern long long dh_proc_start_ms(int pid);                     // collector.c:进程启动时间(unix 毫秒),0=未知
 extern int  dh_restart_daemon(const char *proc);                // collector.c:kickstart 重启 daemon,0=成功
 extern const char *dh_daemons_json(void);                       // collector.c:白名单 [{proc,disp,domain}]
 extern int  dh_app_mem_read(int pid, uint32_t *port, char *bundle, size_t bcap, char *ver, size_t vcap);  // App vm_read 发现
@@ -701,6 +702,7 @@ static NSArray *controlDaemonList(void) {
             @"proc": proc, @"disp": (w[@"disp"] ?: proc), @"domain": (w[@"domain"] ?: @""),
             @"enabled": @(cfgHasMember(DH_KEY_EXECS, proc)),
             @"state": state, @"version": (ver ?: @""), @"pid": @(pid),
+            @"startedAtMs": @(dh_proc_start_ms(pid)),   // 启动时间(unix 毫秒),panel PID 悬停提示;0=未知
             @"latest": @(ver != nil && [ver isEqualToString:@ENGINE_VER]),
             @"count": @(capLineCount(proc)), @"port": @(live ? lanPort : 0),
         }];
@@ -829,6 +831,7 @@ static NSDictionary *controlAppData(void) {
         [out addObject:@{ @"bundle": bundle, @"name": a[@"name"], @"system": a[@"system"],
                           @"enabled": @([en containsObject:bundle]),
                           @"running": @(pid != 0), @"pid": @(pid),
+                          @"startedAtMs": @(dh_proc_start_ms(pid)),   // 启动时间(unix 毫秒),panel PID 悬停提示;0=未知
                           @"suspend": @(sc), @"foreground": @(foreground),
                           @"keepFg": @([bundle isEqualToString:fgKeep]),
                           @"fridaJS": @([[NSFileManager defaultManager] fileExistsAtPath:fridaJsPath(bundle)]),

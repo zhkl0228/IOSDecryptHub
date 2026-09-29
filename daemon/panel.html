@@ -90,7 +90,18 @@ function seltab(el){
 }
 function curTab(){return document.querySelector(".tab.sel").dataset.t;}
 async function post(u){try{var r=await fetch(u,{method:"POST"});return await r.json();}catch(e){return {ok:false,err:"网络错误"};}}
-function pidCell(pid){return pid>0 ? '<span class="n">'+pid+'</span>' : '<span class="off">—</span>';}
+// PID 单元格:有启动时间(unix 毫秒,>0)时挂 title 悬停提示——启动时刻 + 已运行时长。
+function pidCell(pid,startMs){
+  if(!(pid>0)) return '<span class="off">—</span>';
+  var t='';
+  if(startMs>0){
+    var d=new Date(startMs), p=function(n){return ("0"+n).slice(-2);};
+    var up=Math.max(0,Date.now()-startMs), m=Math.floor(up/60000), h=Math.floor(m/60), dd=Math.floor(h/24);
+    var dur = dd>0 ? dd+"天"+(h%24)+"小时" : (h>0 ? h+"小时"+(m%60)+"分" : (m>0 ? m+"分钟" : Math.floor(up/1000)+"秒"));
+    t=' title="启动于 '+d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())+' · 已运行 '+dur+'"';
+  }
+  return '<span class="n"'+t+'>'+pid+'</span>';
+}
 
 /* ---- 系统 daemon ---- */
 async function loadD(){
@@ -107,7 +118,7 @@ async function loadD(){
     var live = d.state=="live";
     h += '<tr><td>'+avatar(d.disp)+'<a href="/d/'+encodeURIComponent(d.proc)+'/">'+esc(d.proc)+'</a>'
        +  '<div class="muted">'+esc(d.disp)+'</div></td>'
-       +  '<td>'+pidCell(d.pid)+'</td>'
+       +  '<td>'+pidCell(d.pid,d.startedAtMs)+'</td>'
        +  '<td><label class="sw"><input type="checkbox" '+(d.enabled?"checked":"")
        +      ' onchange="tog(\''+d.proc+'\',this.checked)"><span class="sl"></span></label></td>'
        +  '<td class="'+sc+'">'+sl+'</td><td>'+ev+'</td><td class="n">'+d.count+'</td>'
@@ -201,7 +212,7 @@ function renderA(){
     var run = x.running ? (x.foreground?'<span class="on">前台</span>':'<span class="off">后台</span>') : '<span class="off">未运行</span>';
     h += '<tr><td>'+iconHtml(x)+esc(x.name)+(x.system?' <span class="tag">系统</span>':'')
       +  '<div class="muted">'+esc(x.bundle)+'</div></td>'
-      +  '<td>'+pidCell(x.pid)+'</td>'
+      +  '<td>'+pidCell(x.pid,x.startedAtMs)+'</td>'
       +  '<td style="text-align:center"><input type="radio" name="fgk" '+(x.keepFg?'checked':'')+' onchange="keepFg(\''+esc(x.bundle)+'\')"></td>'
       +  '<td><label class="sw"><input type="checkbox" '+(x.enabled?"checked":"")
       +      ' onchange="togA(\''+esc(x.bundle)+'\',this.checked)"><span class="sl"></span></label></td>'
