@@ -1193,6 +1193,12 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         sendJSON(fd, @{@"ok": @(ok), @"frida": @(attachReq),
                        @"note": ok ? (attachReq ? @"已切前台 + 已请求 frida attach 注入" : @"已切前台") : @"切前台失败"}); return;
     }
+    // Respring / Userspace 重启前置:必须已解锁 + 亮屏。锁屏/息屏时重启会把设备留在锁屏态,
+    // 前台 App 与注入自动化全停;锁屏态未知(没装 DHUnlock,-1)同样拒——只认确定已解锁。
+    if ([action isEqualToString:@"respring"] || [action isEqualToString:@"userspace-reboot"]) {
+        if (dh_screen_locked() != 0) { sendJSON(fd, @{@"ok": @NO, @"err": @"锁屏或锁屏态未知,先解锁"}); return; }
+        if (dh_screen_brightness() <= 0.0f) { sendJSON(fd, @{@"ok": @NO, @"err": @"屏幕息屏,先亮屏"}); return; }
+    }
     // Respring:kill SpringBoard(launchd KeepAlive 立刻拉起 → 屏幕重启,前台 App 全被打断)。
     // 先回 ACK 再动手(延迟 300ms),保证 web 端收到响应;collector 是独立 daemon,杀 SpringBoard 不影响自己。
     if ([action isEqualToString:@"respring"]) {

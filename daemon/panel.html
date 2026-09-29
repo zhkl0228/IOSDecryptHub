@@ -27,6 +27,7 @@ a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
 .sw input:checked+.sl{background:var(--on)}
 .sw input:checked+.sl:before{transform:translateX(19px)}
 .btn{display:inline-block;padding:5px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer;font-size:13px;line-height:1.4}
+.btn:disabled{opacity:.4;cursor:not-allowed}
 .btn.inj{border-color:var(--ac);color:var(--ac)}
 .btn:hover{border-color:var(--ac)}.btn:active{opacity:.55}
 .txt{padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#0b0d12;color:var(--fg);width:300px;max-width:60vw}
@@ -140,7 +141,7 @@ async function loadA(){
   _fridaAvail = !!a.fridaAvail;
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
-        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" id="pwrbtn" data-mode="unlock" onclick="pwrToggle()">🔓 解锁/亮屏</button> <button class="btn" id="homebtn" onclick="goHome()" style="display:none">🏠 回桌面</button> <button class="btn" onclick="respring()">🔄 Respring</button> <button class="btn" onclick="userspaceReboot()">♻️ Userspace 重启</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
+        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" id="pwrbtn" data-mode="unlock" onclick="pwrToggle()">🔓 解锁/亮屏</button> <button class="btn" id="homebtn" onclick="goHome()" style="display:none">🏠 回桌面</button> <button class="btn" id="rsbtn" onclick="respring()">🔄 Respring</button> <button class="btn" id="usbtn" onclick="userspaceReboot()">♻️ Userspace 重启</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
       + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" id="closefgbtn" onclick="keepFg(\'\')" style="display:none">关闭保持前台</button></div>'
       + '<div id="atbl"></div>'
       + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
@@ -164,6 +165,11 @@ async function loadA(){
   }
   var hb=document.getElementById("homebtn");   // 回桌面:仅解锁 且 有前台 App 时显示(已在桌面/锁屏都没意义)
   if(hb) hb.style.display = (lk===0 && a.foreground && a.foreground.length) ? "" : "none";
+  // Respring / Userspace 重启:后端硬门禁(解锁+亮屏);前端同步禁用,不给点(锁屏/息屏重启会把设备留在锁屏态)。
+  var rs=document.getElementById("rsbtn");
+  if(rs) rs.disabled = !(lk===0 && on);
+  var us=document.getElementById("usbtn");
+  if(us) us.disabled = !(lk===0 && on);
   var cf=document.getElementById("closefgbtn");   // 关闭保持前台:仅设了保持前台目标时才显示
   if(cf) cf.style.display = (a.fgKeep && a.fgKeep.length) ? "" : "none";
   var bt=document.getElementById("batt");
