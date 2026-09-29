@@ -54,3 +54,6 @@ hook 全在引擎里(`src/hooks/`),由引擎 constructor 完成**——上游这
   - ✅ **线 B 例外**:companion 用 `MSHookFunction`/swizzle、collector 常驻监听端口——见上「线 B」。
 - **版本号**:`Makefile` 的 `VERSION`。
 - **构建**:`make deb`(源码编引擎 rootless=arm64 / roothide=arm64+arm64e → `build_deb.sh` 打全包)。
+- **管理器 App 可选(默认跳过)**:web 面板已覆盖其入口(开关/切前台/图标/脱壳),updater 请求
+  可手写 plist 触发;`MANAGER_APP=1 make deb-roothide` 才编译/打包 App。无 App 的包装在
+  有 App 的旧包上,dpkg 会自动移除 App 文件。

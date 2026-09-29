@@ -17,6 +17,7 @@
 #   ./build_deb.sh              # 构建全部目标
 #   ./build_deb.sh rootless     # 仅普通 rootless
 #   ./build_deb.sh roothide     # 仅 roothide
+#   MANAGER_APP=1 ./build_deb.sh roothide  # 打包管理器 App(默认跳过,面板已覆盖其功能)
 #
 # 前提: macOS + Xcode (xcrun) + dpkg-deb + ldid
 # 产物: build/deb/com.iosdecrypthub_<version>_<目标>.deb
@@ -87,6 +88,10 @@ FRIDA_BIN="IOSDecryptHubFrida"
 FRIDA_LABEL="com.iosdecrypthub.frida"
 FRIDA_DEVKIT="$SCRIPT_DIR/vendor/frida-core-devkit"
 FRIDA_ENT="$SCRIPT_DIR/daemon/frida_entitlements.plist"
+
+# 管理器 App 可选(默认跳过编译/打包):web 面板已覆盖开关/切前台/图标/脱壳等入口,updater 请求
+# 可手写 plist 触发;要打包 App 需显式 MANAGER_APP=1 ./build_deb.sh roothide(或 make deb-roothide)。
+MANAGER_APP="${MANAGER_APP:-0}"
 
 compile_loader() {
     local ARCHS="$1"
@@ -284,7 +289,11 @@ build_variant() {
 
     ENGINE_DYLIB=$(require_vendor_dylib "$ENGINE_VARIANT" "$MACHO_ARCHS")
     compile_loader "$MACHO_ARCHS" "$LOADER_OUT"
-    compile_app "$APP_MACHO_ARCHS" "$APP_EXEC"
+    if [ "$MANAGER_APP" != "0" ]; then
+        compile_app "$APP_MACHO_ARCHS" "$APP_EXEC"
+    else
+        info "跳过管理器 App(默认;MANAGER_APP=1 才打包)"
+    fi
     compile_daemon "$APP_MACHO_ARCHS" "$DAEMON_OUT"
     # companion 要 arm64e 切片才能注入 arm64e 系统 daemon;collector 是 root 独立进程,arm64 即可。
     compile_companion "$MACHO_ARCHS" "$COMPANION_OUT"
@@ -310,7 +319,7 @@ build_variant() {
     mkdir -p "$STAGE/DEBIAN"
     mkdir -p "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries"
     mkdir -p "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub"
-    mkdir -p "$STAGE/${PREFIX}/Applications/$APP_NAME.app"
+    if [ "$MANAGER_APP" != "0" ]; then mkdir -p "$STAGE/${PREFIX}/Applications/$APP_NAME.app"; fi
     mkdir -p "$STAGE/${PREFIX}/Library/LaunchDaemons"
     mkdir -p "$STAGE/${PREFIX}/etc/apt/trusted.gpg.d"
 
@@ -379,20 +388,22 @@ VP
     sed "s|@PREFIX@|${PREFIX}|g" "$DAEMON_PLIST_TMPL" \
         > "$STAGE/${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.updated.plist"
 
-    cp "$APP_EXEC" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
-    sed "s/@VERSION@/${VERSION}/g" "$APP_INFO" \
-        > "$STAGE/${PREFIX}/Applications/$APP_NAME.app/Info.plist"
-    [ -f "$APP_ICON" ] || error "缺少 app/Icon.png (App 图标)"
-    [ -f "$APP_WECHAT" ] || error "缺少 app/wechat-follow.png（App 里的公众号引导）"
-    # 桌面图标按标准三档出图：只给一张 120×120 时部分系统/缩放档位会渲染成空白
-    local APP_ICON_DIR="$STAGE/${PREFIX}/Applications/$APP_NAME.app"
-    cp "$APP_WECHAT" "$APP_ICON_DIR/wechat-follow.png"
-    cp "$APP_ICON" "$APP_ICON_DIR/Icon.png"
-    sips -z 60 60 "$APP_ICON" --out "$APP_ICON_DIR/Icon.png" >/dev/null 2>&1 || true
-    sips -z 120 120 "$APP_ICON" --out "$APP_ICON_DIR/Icon@2x.png" >/dev/null 2>&1 || true
-    sips -z 180 180 "$APP_ICON" --out "$APP_ICON_DIR/Icon@3x.png" >/dev/null 2>&1 || true
-    [ -f "$APP_ICON_DIR/Icon@2x.png" ] || error "App 图标生成失败"
-    [ -f "$APP_ICON_DIR/Icon@3x.png" ] || error "App 图标生成失败"
+    if [ "$MANAGER_APP" != "0" ]; then
+        cp "$APP_EXEC" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
+        sed "s/@VERSION@/${VERSION}/g" "$APP_INFO" \
+            > "$STAGE/${PREFIX}/Applications/$APP_NAME.app/Info.plist"
+        [ -f "$APP_ICON" ] || error "缺少 app/Icon.png (App 图标)"
+        [ -f "$APP_WECHAT" ] || error "缺少 app/wechat-follow.png（App 里的公众号引导）"
+        # 桌面图标按标准三档出图：只给一张 120×120 时部分系统/缩放档位会渲染成空白
+        local APP_ICON_DIR="$STAGE/${PREFIX}/Applications/$APP_NAME.app"
+        cp "$APP_WECHAT" "$APP_ICON_DIR/wechat-follow.png"
+        cp "$APP_ICON" "$APP_ICON_DIR/Icon.png"
+        sips -z 60 60 "$APP_ICON" --out "$APP_ICON_DIR/Icon.png" >/dev/null 2>&1 || true
+        sips -z 120 120 "$APP_ICON" --out "$APP_ICON_DIR/Icon@2x.png" >/dev/null 2>&1 || true
+        sips -z 180 180 "$APP_ICON" --out "$APP_ICON_DIR/Icon@3x.png" >/dev/null 2>&1 || true
+        [ -f "$APP_ICON_DIR/Icon@2x.png" ] || error "App 图标生成失败"
+        [ -f "$APP_ICON_DIR/Icon@3x.png" ] || error "App 图标生成失败"
+    fi
 
     cat > "$STAGE/DEBIAN/postinst" << POSTINST
 #!/bin/sh
@@ -537,12 +548,18 @@ if [ -x "\$FRIDA_BIN_PATH" ]; then
         launchctl bootstrap system "\$FRIDA_PLIST" 2>/dev/null || launchctl load "\$FRIDA_PLIST" 2>/dev/null || true
     fi
 fi
+POSTINST
+    if [ "$MANAGER_APP" != "0" ]; then
+        cat >> "$STAGE/DEBIAN/postinst" << POSTINST
 # 刷新主屏幕图标（失败不阻断安装）
 if command -v uicache >/dev/null 2>&1; then
     uicache -p "${PREFIX}/Applications/$APP_NAME.app" 2>/dev/null || true
 fi
 exit 0
 POSTINST
+    else
+        printf 'exit 0\n' >> "$STAGE/DEBIAN/postinst"
+    fi
     chmod 0755 "$STAGE/DEBIAN/postinst"
 
     cat > "$STAGE/DEBIAN/postrm" << POSTRM
@@ -573,9 +590,11 @@ POSTRM
     verify_macho_arch \
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib" \
         "$MACHO_ARCHS" "$VARIANT 主 dylib"
-    verify_macho_arch \
-        "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME" \
-        "$APP_MACHO_ARCHS" "$VARIANT 管理器 App"
+    if [ "$MANAGER_APP" != "0" ]; then
+        verify_macho_arch \
+            "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME" \
+            "$APP_MACHO_ARCHS" "$VARIANT 管理器 App"
+    fi
     verify_macho_arch \
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN" \
         "$APP_MACHO_ARCHS" "$VARIANT updater daemon"
@@ -588,7 +607,9 @@ POSTRM
 
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
-    ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
+    if [ "$MANAGER_APP" != "0" ]; then
+        ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
+    fi
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$COMPANION_DYLIB"
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/$DHUNLOCK_DYLIB"
@@ -601,7 +622,9 @@ POSTRM
     find "$PKG_STAGE" -type f -exec chmod 0644 {} +
     chmod 0755 "$PKG_STAGE/DEBIAN"
     chmod 0755 "$PKG_STAGE/DEBIAN"/postinst "$PKG_STAGE/DEBIAN"/postrm
-    chmod 0755 "$PKG_STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
+    if [ "$MANAGER_APP" != "0" ]; then
+        chmod 0755 "$PKG_STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
+    fi
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/updated.sh"
     # 两个 dylib 用 0755：与 1.24.8 / 1.24.9（线上已验证可用）的权限完全一致，
@@ -650,27 +673,30 @@ POSTRM
         *) error "$VARIANT 缺少加载器" ;;
     esac
 
-    case "$PACKAGE_CONTENTS" in
-        *"/Applications/$APP_NAME.app/$APP_NAME"*) ;;
-        *) error "$VARIANT 缺少管理器 App" ;;
-    esac
-
-    case "$PACKAGE_CONTENTS" in
-        *"/Applications/$APP_NAME.app/Info.plist"*) ;;
-        *) error "$VARIANT 缺少 App Info.plist" ;;
-    esac
-
-    case "$PACKAGE_CONTENTS" in
-        *"/Applications/$APP_NAME.app/wechat-follow.png"*) ;;
-        *) error "$VARIANT 缺少 App 内公众号引导图" ;;
-    esac
-
-    for ICON_NAME in Icon.png Icon@2x.png Icon@3x.png; do
+    if [ "$MANAGER_APP" != "0" ]; then
         case "$PACKAGE_CONTENTS" in
-            *"/Applications/$APP_NAME.app/$ICON_NAME"*) ;;
-            *) error "$VARIANT 缺少桌面图标 $ICON_NAME" ;;
+            *"/Applications/$APP_NAME.app/$APP_NAME"*) ;;
+            *) error "$VARIANT 缺少管理器 App" ;;
         esac
-    done
+    
+        case "$PACKAGE_CONTENTS" in
+            *"/Applications/$APP_NAME.app/Info.plist"*) ;;
+            *) error "$VARIANT 缺少 App Info.plist" ;;
+        esac
+    
+        case "$PACKAGE_CONTENTS" in
+            *"/Applications/$APP_NAME.app/wechat-follow.png"*) ;;
+            *) error "$VARIANT 缺少 App 内公众号引导图" ;;
+        esac
+    
+        for ICON_NAME in Icon.png Icon@2x.png Icon@3x.png; do
+            case "$PACKAGE_CONTENTS" in
+                *"/Applications/$APP_NAME.app/$ICON_NAME"*) ;;
+                *) error "$VARIANT 缺少桌面图标 $ICON_NAME" ;;
+            esac
+        done
+    fi
+
 
     case "$PACKAGE_CONTENTS" in
         *"/usr/lib/IOSDecryptHub/$DAEMON_BIN"*) ;;
@@ -743,9 +769,11 @@ POSTRM
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/version.plist" \
         || error "$VARIANT 的引擎版本文件未写入变体名"
 
-    grep -q "<string>${VERSION}</string>" \
-        "$STAGE/${PREFIX}/Applications/$APP_NAME.app/Info.plist" \
-        || error "$VARIANT 的 App Info.plist 未写入当前版本"
+    if [ "$MANAGER_APP" != "0" ]; then
+        grep -q "<string>${VERSION}</string>" \
+            "$STAGE/${PREFIX}/Applications/$APP_NAME.app/Info.plist" \
+            || error "$VARIANT 的 App Info.plist 未写入当前版本"
+    fi
 
     info "✅ $DEB_OUT ($(du -h "$DEB_OUT" | cut -f1))"
 }
