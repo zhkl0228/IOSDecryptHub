@@ -140,7 +140,7 @@ async function loadA(){
   _fridaAvail = !!a.fridaAvail;
   if(!document.getElementById("af")){
     document.getElementById("app").innerHTML =
-        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" id="pwrbtn" data-mode="unlock" onclick="pwrToggle()">解锁/亮屏</button> <button class="btn" id="homebtn" onclick="goHome()" style="display:none">回桌面</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
+        '<div class="row-actions" style="margin-bottom:8px"><button class="btn" id="pwrbtn" data-mode="unlock" onclick="pwrToggle()">🔓 解锁/亮屏</button> <button class="btn" id="homebtn" onclick="goHome()" style="display:none">🏠 回桌面</button> <button class="btn" onclick="respring()">🔄 Respring</button> <button class="btn" onclick="userspaceReboot()">♻️ Userspace 重启</button> <span class="muted">屏幕:</span> <b id="scr">…</b> &nbsp; <span class="muted">电量:</span> <b id="batt">…</b> &nbsp; <span class="muted">当前前台:</span> <b id="fgnow">…</b></div>'
       + '<div class="row-actions" style="margin-bottom:12px"><input class="txt" id="af" placeholder="搜索 App 名 / bundle id" oninput="renderA()"><span class="muted" id="acnt"></span> <button class="btn" id="closefgbtn" onclick="keepFg(\'\')" style="display:none">关闭保持前台</button></div>'
       + '<div id="atbl"></div>'
       + '<div class="muted" style="margin-top:10px">App 由 ElleKit loader 按 bundle id 白名单注入(线 A);开启后<b>重启该 App</b> 生效。系统 App 默认列出。'
@@ -160,7 +160,7 @@ async function loadA(){
   var pb=document.getElementById("pwrbtn");
   if(pb){
     if(lk===0){ pb.textContent="🔒 锁屏"; pb.dataset.mode="lock"; }
-    else { pb.textContent="解锁/亮屏"; pb.dataset.mode="unlock"; }
+    else { pb.textContent="🔓 解锁/亮屏"; pb.dataset.mode="unlock"; }
   }
   var hb=document.getElementById("homebtn");   // 回桌面:仅解锁 且 有前台 App 时显示(已在桌面/锁屏都没意义)
   if(hb) hb.style.display = (lk===0 && a.foreground && a.foreground.length) ? "" : "none";
@@ -251,6 +251,18 @@ async function goHome(){
   var r = await post("/api/control/home");
   toast(r.ok ? "已回桌面" : ("失败:"+(r.err||"")), !r.ok);
   setTimeout(loadA, 1200);   // 刷新前台状态
+}
+async function respring(){
+  if(!confirm("确认 Respring?将重启 SpringBoard,设备当前前台 App 会被打断。")) return;
+  var r = await post("/api/control/respring");
+  toast(r.ok ? "已发 Respring,SpringBoard 重启中…(数秒后恢复)" : ("失败:"+(r.err||"")), !r.ok);
+  setTimeout(loadA, 5000);   // SpringBoard 重启完刷新锁屏/前台态
+}
+async function userspaceReboot(){
+  if(!confirm("确认 Userspace 重启?所有用户进程(SpringBoard、全部系统 daemon、App)都会重启,内核不重启;SSH 与面板会中断约 20-30 秒后自动恢复。")) return;
+  var r = await post("/api/control/userspace-reboot");
+  toast(r.ok ? "已发 Userspace 重启指令…(SSH 会断,稍候自动恢复)" : ("失败:"+(r.err||"")), !r.ok);
+  setTimeout(loadA, 30000);   // 全用户态重启完再刷新
 }
 
 /* ---- 脱壳(ipadecrypt-helper;目标 App 无需注入引擎)---- */

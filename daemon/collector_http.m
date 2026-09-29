@@ -1193,6 +1193,37 @@ static void handleControl(int fd, NSString *action, NSDictionary *q) {
         sendJSON(fd, @{@"ok": @(ok), @"frida": @(attachReq),
                        @"note": ok ? (attachReq ? @"已切前台 + 已请求 frida attach 注入" : @"已切前台") : @"切前台失败"}); return;
     }
+    // Respring:kill SpringBoard(launchd KeepAlive 立刻拉起 → 屏幕重启,前台 App 全被打断)。
+    // 先回 ACK 再动手(延迟 300ms),保证 web 端收到响应;collector 是独立 daemon,杀 SpringBoard 不影响自己。
+    if ([action isEqualToString:@"respring"]) {
+        sendJSON(fd, @{@"ok": @YES, @"note": @"SpringBoard 重启中"}); 
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            int pid = dh_proc_alive("SpringBoard");
+            if (pid > 0) kill(pid, SIGKILL);
+        });
+        return;
+    }
+    // Userspace 重启(launchd 重启所有用户态进程:SpringBoard+全部 daemon/App,内核不动;越狱注入全刷新)。
+    // 本 collector 自己也会被杀由 KeepAlive 拉起——必须先回 ACK 再动手。用 launchctl reboot userspace
+    // (实测 rootful 可用;root 直通)。不用 ldrestart:实测它逐服务 stop 全被 launchd 以
+    // "144 Requestor lacks required entitlement" 拒绝(该二进制的 entitlement 是仓库真签,换不成)。
+    // 无兜底:posix_spawn 失败只记 warn 落 collector.log,失败可见可查,不臆想降级路径。
+    if ([action isEqualToString:@"userspace-reboot"]) {
+        sendJSON(fd, @{@"ok": @YES, @"note": @"userspace 重启中(所有用户进程含本 collector 都会重启)"});
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            char lc[64]; dh_jb_path(lc, sizeof lc, "/usr/bin/launchctl");
+            const char *ctl = access(lc, X_OK) == 0 ? lc
+                            : (access("/usr/bin/launchctl", X_OK) == 0 ? "/usr/bin/launchctl" : "/bin/launchctl");
+            pid_t pid = 0; char *const argv[] = { (char *)ctl, (char *)"reboot", (char *)"userspace", NULL };
+            if (posix_spawn(&pid, ctl, NULL, NULL, argv, NULL) != 0)
+                dh_log([[NSString stringWithFormat:
+                    @"[agg] userspace-reboot:posix_spawn(%s reboot userspace) 失败 errno=%d——未重启,查根因",
+                    ctl, errno] UTF8String]);
+        });
+        return;
+    }
     send404(fd);
 }
 
